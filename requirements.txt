@@ -2,7 +2,11 @@ pandas
 numpy
 scikit-learn
 xgboost
+lightgbm
+matplotlib
+seaborn
+joblib
+plotly
+streamlit
 supabase
 python-dotenv
-requests
-streamlit

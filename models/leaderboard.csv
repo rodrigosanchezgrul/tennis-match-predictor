@@ -1,0 +1,13 @@
+model_name,feature_mode,full_label,train_acc,test_acc,overfit_gap,train_auc,test_auc,train_brier,test_brier,fit_status,train_seconds
+Logistic Regression,Raw Features,Logistic Regression [Raw Features],0.6411,0.6492,-0.0081,0.7015,0.7111,0.2183,0.2156,Well-Balanced,0.22
+Linear Regression (LPM),Raw Features,Linear Regression (LPM) [Raw Features],0.6413,0.6485,-0.0071,0.7015,0.7104,0.2184,0.2158,Well-Balanced,0.17
+XGBoost Regressor,Raw Features,XGBoost Regressor [Raw Features],0.6662,0.6483,0.0179,0.7305,0.7103,0.2096,0.216,Well-Balanced,1.75
+XGBoost Classifier,Raw Features,XGBoost Classifier [Raw Features],0.662,0.6502,0.0119,0.7265,0.7101,0.2106,0.216,Well-Balanced,1.52
+Logistic Regression,With PCA (95%),Logistic Regression [With PCA (95%)],0.6395,0.6508,-0.0113,0.7001,0.7096,0.2189,0.2161,Well-Balanced,0.1
+Linear Regression (LPM),With PCA (95%),Linear Regression (LPM) [With PCA (95%)],0.6393,0.6502,-0.0109,0.7001,0.7094,0.219,0.2163,Well-Balanced,0.08
+LightGBM Classifier,Raw Features,LightGBM Classifier [Raw Features],0.6607,0.6476,0.0131,0.7254,0.7089,0.2109,0.2165,Well-Balanced,1.03
+Random Forest,Raw Features,Random Forest [Raw Features],0.6879,0.6467,0.0412,0.7542,0.7086,0.2025,0.2166,Overfitting (High Train-Test Gap),5.32
+LightGBM Classifier,With PCA (95%),LightGBM Classifier [With PCA (95%)],0.6553,0.6464,0.0089,0.7186,0.7049,0.213,0.2178,Well-Balanced,0.81
+XGBoost Classifier,With PCA (95%),XGBoost Classifier [With PCA (95%)],0.6583,0.6452,0.0131,0.7211,0.7041,0.2123,0.2181,Well-Balanced,1.61
+XGBoost Regressor,With PCA (95%),XGBoost Regressor [With PCA (95%)],0.6615,0.6433,0.0182,0.7244,0.704,0.2114,0.2181,Well-Balanced,1.65
+Random Forest,With PCA (95%),Random Forest [With PCA (95%)],0.6825,0.6473,0.0352,0.7513,0.7035,0.2032,0.2182,Overfitting (High Train-Test Gap),5.88

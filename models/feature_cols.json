@@ -1,0 +1,17 @@
+[
+  "elo_diff",
+  "surf_elo_diff",
+  "elo_win_prob",
+  "surf_elo_win_prob",
+  "p1_elo",
+  "p2_elo",
+  "p1_surf_elo",
+  "p2_surf_elo",
+  "is_atp",
+  "best_of",
+  "surf_hard",
+  "surf_clay",
+  "surf_grass",
+  "p1_lefty",
+  "p2_lefty"
+]
