@@ -1,5 +1,8 @@
 ﻿import json
 import os
+import re
+import urllib.request
+from datetime import datetime, timedelta, timezone
 import joblib
 import numpy as np
 import pandas as pd
@@ -16,6 +19,141 @@ st.set_page_config(
     page_icon="🎾",
     layout="wide",
 )
+
+
+# ==============================================================================
+# HELPERS & ESPN LIVE SCHEDULE FETCHER
+# ==============================================================================
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _infer_surface(tourney_name: str) -> str:
+    name = (tourney_name or "").lower()
+    clay = [
+        "roland garros", "french open", "madrid", "rome", "internazionali",
+        "monte-carlo", "monte carlo", "barcelona", "hamburg", "bastad",
+        "gstaad", "kitzbuhel", "umag", "palermo", "rabat", "strasbourg",
+        "charleston", "bogota", "rio", "buenos aires", "santiago", "estoril",
+        "lyon", "geneva", "munich", "marrakech", "bucharest", "houston", "iasi",
+    ]
+    grass = [
+        "wimbledon", "halle", "queen", "eastbourne", "mallorca",
+        "hertogenbosch", "stuttgart", "bad homburg", "nottingham", "birmingham", "berlin",
+    ]
+    if any(k in name for k in clay):
+        return "Clay"
+    if any(k in name for k in grass):
+        return "Grass"
+    return "Hard"
+
+
+def _infer_level(tourney_name: str) -> str:
+    name = (tourney_name or "").lower()
+    if any(g in name for g in ["australian open", "roland garros", "french open", "wimbledon", "us open"]):
+        return "G"
+    if any(m in name for m in ["masters", "1000", "indian wells", "miami", "madrid", "rome", "canada", "cincinnati", "shanghai", "paris", "doha", "dubai", "beijing", "wuhan"]):
+        return "M"
+    return "A"
+
+
+def _is_valid_singles_draw(draw_name: str, tour_label: str) -> bool:
+    d = (draw_name or "").lower()
+    if "singles" not in d:
+        return False
+    if any(x in d for x in ["wheelchair", "junior", "boy", "girl", "quad", "legend"]):
+        return False
+    if tour_label == "ATP" and "women" in d:
+        return False
+    if tour_label == "WTA" and re.search(r"\bmen('s)?\b", d):
+        return False
+    return True
+
+
+@st.cache_data(ttl=300)
+def fetch_upcoming_espn_matches() -> pd.DataFrame:
+    """Fetches upcoming & in-progress ATP and WTA singles matches (next 48h) from ESPN."""
+    now_utc = datetime.now(timezone.utc)
+    end_utc = now_utc + timedelta(days=2)
+    date_range = f"{now_utc.strftime('%Y%m%d')}-{end_utc.strftime('%Y%m%d')}"
+
+    rows = []
+    seen = set()
+
+    for slug, tour_label in [("atp", "ATP"), ("wta", "WTA")]:
+        url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{slug}/scoreboard?dates={date_range}&limit=100"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+        except Exception:
+            continue
+
+        for event in payload.get("events", []):
+            t_name = event.get("name", f"{tour_label} Event")
+            surface = _infer_surface(t_name)
+            level = _infer_level(t_name)
+            best_of = 5 if (tour_label == "ATP" and level == "G") else 3
+
+            comps = []
+            groups = event.get("groupings", [])
+            if groups:
+                for grp in groups:
+                    draw_name = grp.get("grouping", {}).get("displayName", "")
+                    if not _is_valid_singles_draw(draw_name, tour_label):
+                        continue
+                    comps.extend(grp.get("competitions", []))
+            else:
+                comps.extend(event.get("competitions", []))
+
+            for comp in comps:
+                status_type = comp.get("status", {}).get("type", {})
+                if status_type.get("completed", False):
+                    continue
+
+                competitors = comp.get("competitors", [])
+                if len(competitors) != 2:
+                    continue
+
+                p1_name = (competitors[0].get("athlete") or competitors[0].get("team") or {}).get("displayName", "")
+                p2_name = (competitors[1].get("athlete") or competitors[1].get("team") or {}).get("displayName", "")
+                if not p1_name or not p2_name or "TBD" in (p1_name, p2_name):
+                    continue
+
+                dedup = (tour_label, _norm_name(p1_name), _norm_name(p2_name))
+                if dedup in seen:
+                    continue
+                seen.add(dedup)
+
+                raw_dt = comp.get("date") or ""
+                try:
+                    dt_obj = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+                    time_label = dt_obj.strftime("%b %d • %H:%M UTC")
+                    sort_ts = dt_obj.timestamp()
+                except Exception:
+                    time_label = status_type.get("shortDetail") or "Scheduled"
+                    sort_ts = 0.0
+
+                state = status_type.get("state", "pre")
+                status_badge = "🔴 LIVE" if state == "in" else f"🕒 {time_label}"
+
+                rows.append({
+                    "sort_ts": sort_ts,
+                    "Status": status_badge,
+                    "IsLive": state == "in",
+                    "Tour": tour_label,
+                    "Tournament": t_name,
+                    "Surface": surface,
+                    "Round": (comp.get("round") or {}).get("displayName") or "",
+                    "BestOf": best_of,
+                    "Player1": p1_name,
+                    "Player2": p2_name,
+                })
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows).sort_values(["IsLive", "sort_ts"], ascending=[False, True]).reset_index(drop=True)
 
 
 # ==============================================================================
@@ -49,6 +187,8 @@ def load_players() -> pd.DataFrame:
 @st.cache_data(ttl=600)
 def load_player_matches(player_uid: str) -> pd.DataFrame:
     """Fetches all career matches (2015-present) for one player from Supabase."""
+    if not player_uid:
+        return pd.DataFrame()
     sb = get_supabase()
     all_rows = []
     start = 0
@@ -131,7 +271,7 @@ def predict_prob_single(pipeline, X_row: pd.DataFrame) -> float:
     return float(np.clip(pipeline.predict(X_row)[0], 0.0, 1.0))
 
 
-def build_matchup_row(p1: pd.Series, p2: pd.Series, tour: str, surface: str, best_of: int, feature_cols: list) -> pd.DataFrame:
+def build_matchup_row(p1, p2, tour: str, surface: str, best_of: int, feature_cols: list) -> pd.DataFrame:
     surf_col = f"elo_{surface.lower()}"
     p1_elo = float(p1["elo_overall"])
     p2_elo = float(p2["elo_overall"])
@@ -161,19 +301,47 @@ def build_matchup_row(p1: pd.Series, p2: pd.Series, tour: str, surface: str, bes
     return pd.DataFrame([row])[feature_cols]
 
 
+def build_player_lookup(players_df: pd.DataFrame) -> dict:
+    lookup = {}
+    for row in players_df.to_dict(orient="records"):
+        key = (row["tour"], _norm_name(row["player_name"]))
+        if key not in lookup:
+            lookup[key] = row
+    return lookup
+
+
+def get_player_or_default(lookup: dict, tour: str, name: str) -> dict:
+    return lookup.get(
+        (tour, _norm_name(name)),
+        {
+            "player_id": "",
+            "tour": tour,
+            "player_name": name,
+            "hand": "R",
+            "matches_played": 0,
+            "elo_overall": 1500.0,
+            "elo_hard": 1500.0,
+            "elo_clay": 1500.0,
+            "elo_grass": 1500.0,
+        },
+    )
+
+
 # ==============================================================================
 # MAIN UI
 # ==============================================================================
 st.title("🎾 ATP & WTA Machine Learning Match Predictor Lab")
-st.caption("Chronological Surface-Elo Engine • Multi-Model Benchmark (Raw vs. PCA) • Live Supabase Database")
+st.caption("Chronological Surface-Elo Engine • Multi-Model Benchmark (Raw vs. PCA) • Live Supabase & ESPN Sync")
 
 players_df = load_players()
+player_lookup = build_player_lookup(players_df)
 leaderboard_df = load_leaderboard()
 feature_cols = load_feature_cols()
 pipelines = load_all_pipelines(leaderboard_df["full_label"].tolist())
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "🔮 Live Match Predictor",
+tab_today, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📅 Today's Match Forecasts",
+    "🔮 Custom Matchup Simulator",
     "🏆 Model Leaderboard & Overfitting Lab",
     "📈 Diagnostic Graphs & Learning Curves",
     "📊 ATP / WTA Elo Rankings",
@@ -181,7 +349,132 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 # ------------------------------------------------------------------------------
-# TAB 1: LIVE MATCH PREDICTOR (ALL MODELS SIDE-BY-SIDE + RECENT FORM)
+# TAB 0: TODAY'S & UPCOMING SCHEDULED MATCHES FORECASTS
+# ------------------------------------------------------------------------------
+with tab_today:
+    st.subheader("Live & Upcoming ATP / WTA Match Forecasts (Next 48 Hours)")
+
+    fc1, fc2, fc3 = st.columns([1, 2, 1])
+    slate_tour = fc1.selectbox("Tour Filter", ["ALL", "ATP", "WTA"], key="slate_tour")
+    slate_model = fc2.selectbox("Primary Forecast Model", leaderboard_df["full_label"].tolist(), index=0, key="slate_model")
+    min_conf = fc3.slider("Min Win Probability (%)", 50, 90, 50, key="slate_conf")
+
+    upcoming_df = fetch_upcoming_espn_matches()
+
+    if upcoming_df.empty:
+        st.info(
+            "No scheduled ATP or WTA singles matches were found on ESPN for the next 48 hours "
+            "(either matches are between tournaments or in the off-season). Use **🔮 Custom Matchup Simulator** to simulate any pairing!"
+        )
+    else:
+        if slate_tour != "ALL":
+            upcoming_df = upcoming_df[upcoming_df["Tour"] == slate_tour].reset_index(drop=True)
+
+        forecast_rows = []
+        detailed_matches = []
+
+        for _, m in upcoming_df.iterrows():
+            p1 = get_player_or_default(player_lookup, m["Tour"], m["Player1"])
+            p2 = get_player_or_default(player_lookup, m["Tour"], m["Player2"])
+            X_m = build_matchup_row(p1, p2, m["Tour"], m["Surface"], int(m["BestOf"]), feature_cols)
+
+            prob1_primary = predict_prob_single(pipelines[slate_model], X_m)
+            prob2_primary = 1.0 - prob1_primary
+
+            all_p1_probs = [predict_prob_single(pipelines[lbl], X_m) for lbl in leaderboard_df["full_label"]]
+            p1_votes = sum(1 for pr in all_p1_probs if pr >= 0.5)
+            total_models = len(all_p1_probs)
+
+            if prob1_primary >= 0.5:
+                fav_name = m["Player1"]
+                fav_prob = prob1_primary * 100
+                consensus = f"{p1_votes}/{total_models} models"
+            else:
+                fav_name = m["Player2"]
+                fav_prob = prob2_primary * 100
+                consensus = f"{total_models - p1_votes}/{total_models} models"
+
+            if fav_prob < min_conf:
+                continue
+
+            surf_key = f"elo_{m['Surface'].lower()}"
+            match_label = f"[{m['Tour']}] {m['Player1']} vs {m['Player2']} — {m['Tournament']}"
+
+            forecast_rows.append({
+                "Time / Status": m["Status"],
+                "Tour": m["Tour"],
+                "Tournament": m["Tournament"],
+                "Surface": m["Surface"],
+                "Matchup": f"{m['Player1']} vs {m['Player2']}",
+                "Predicted Winner": f"🏆 {fav_name}",
+                "Win Prob %": round(fav_prob, 1),
+                "Model Consensus": consensus,
+                f"P1 Elo ({m['Surface']})": f"{p1['elo_overall']:.0f} ({p1[surf_key]:.0f})",
+                f"P2 Elo ({m['Surface']})": f"{p2['elo_overall']:.0f} ({p2[surf_key]:.0f})",
+            })
+            detailed_matches.append((match_label, m, p1, p2, X_m, prob1_primary))
+
+        if not forecast_rows:
+            st.warning("No scheduled matches match your current filter settings. Lower the minimum win probability slider or select ALL tours.")
+        else:
+            f_df = pd.DataFrame(forecast_rows)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Matches on Slate", len(f_df))
+            k2.metric("ATP Matches", int((f_df["Tour"] == "ATP").sum()))
+            k3.metric("WTA Matches", int((f_df["Tour"] == "WTA").sum()))
+            k4.metric("Strong Favorites (≥65%)", int((f_df["Win Prob %"] >= 65.0).sum()))
+
+            st.dataframe(
+                f_df.style.format({"Win Prob %": "{:.1f}%"}),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+            # Deep-Dive Inspector for Any Scheduled Match
+            st.markdown("---")
+            st.subheader("Inspect Any Scheduled Match in Detail")
+            selected_idx = st.selectbox(
+                "Choose a match from today's slate",
+                range(len(detailed_matches)),
+                format_func=lambda i: detailed_matches[i][0],
+            )
+            _, sel_m, sel_p1, sel_p2, sel_X, sel_prob1 = detailed_matches[selected_idx]
+
+            dm1, dm2, dm3 = st.columns([2, 1, 2])
+            with dm1:
+                st.metric(
+                    label=f"{sel_m['Player1']} (Elo: {sel_p1['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p1[f'elo_{sel_m[\"Surface\"].lower()}']:.0f})",
+                    value=f"{sel_prob1:.1%} Win Chance",
+                )
+            with dm2:
+                st.markdown(
+                    f"<div style='text-align:center; padding-top:10px;'><b>{sel_m['Surface']}</b><br>{sel_m['Status']}</div>",
+                    unsafe_allow_html=True,
+                )
+            with dm3:
+                st.metric(
+                    label=f"{sel_m['Player2']} (Elo: {sel_p2['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p2[f'elo_{sel_m[\"Surface\"].lower()}']:.0f})",
+                    value=f"{(1.0 - sel_prob1):.1%} Win Chance",
+                )
+
+            p1_recent = load_player_matches(sel_p1.get("player_id", ""))
+            p2_recent = load_player_matches(sel_p2.get("player_id", ""))
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                st.markdown(f"**{sel_m['Player1']} — Last 5 Matches**")
+                if p1_recent.empty:
+                    st.caption("No historical matches on file yet.")
+                else:
+                    st.dataframe(p1_recent.head(5)[["Date", "Result", "Opponent", "Score", "Surface"]], use_container_width=True, hide_index=True)
+            with rc2:
+                st.markdown(f"**{sel_m['Player2']} — Last 5 Matches**")
+                if p2_recent.empty:
+                    st.caption("No historical matches on file yet.")
+                else:
+                    st.dataframe(p2_recent.head(5)[["Date", "Result", "Opponent", "Score", "Surface"]], use_container_width=True, hide_index=True)
+
+# ------------------------------------------------------------------------------
+# TAB 1: CUSTOM MATCHUP SIMULATOR (ALL MODELS SIDE-BY-SIDE + RECENT FORM)
 # ------------------------------------------------------------------------------
 with tab1:
     st.subheader("Head-to-Head Matchup Simulator")
@@ -224,7 +517,6 @@ with tab1:
                 value=f"{p2_prob:.1%} Win Chance",
             )
 
-        # Recent Form & Head-to-Head Preview
         p1_hist = load_player_matches(p1_row["player_id"])
         p2_hist = load_player_matches(p2_row["player_id"])
 
@@ -262,7 +554,6 @@ with tab1:
                     hide_index=True,
                 )
 
-        # All 12 Models Consensus Chart
         st.subheader("How All 12 Trained Models Vote on This Match")
         model_votes = []
         for _, lb_row in leaderboard_df.iterrows():
@@ -411,7 +702,6 @@ with tab5:
     if match_log.empty:
         st.info("No matches found for this player yet.")
     else:
-        # Summary KPIs
         total_w = int(match_log["Won"].sum())
         total_l = len(match_log) - total_w
         win_pct = (total_w / len(match_log)) * 100 if len(match_log) else 0.0
@@ -427,7 +717,6 @@ with tab5:
             f"{sel_player['elo_hard']:.0f} / {sel_player['elo_clay']:.0f} / {sel_player['elo_grass']:.0f}",
         )
 
-        # Elo Progression Chart
         elo_series = match_log.dropna(subset=["Player Elo"]).iloc[::-1].copy()
         if len(elo_series) > 1:
             fig_elo = px.line(
@@ -441,7 +730,6 @@ with tab5:
             fig_elo.update_layout(height=320, margin=dict(l=20, r=20, t=45, b=20))
             st.plotly_chart(fig_elo, use_container_width=True)
 
-        # Filter & Display Match Table
         sf1, sf2 = st.columns([1, 2])
         result_filter = sf1.radio("Result Filter", ["All", "Wins Only", "Losses Only"], horizontal=True)
         opp_search = sf2.text_input("Filter by Opponent or Tournament", "", key="hist_search")
