@@ -1,25 +1,36 @@
-﻿import json
+﻿import calendar
+import json
+import re
 import urllib.request
+import zlib
 from datetime import datetime, timezone
 import pandas as pd
 
 
+def _norm_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _fallback_id(name: str) -> int:
+    return 9000000 + (zlib.crc32(_norm_name(name).encode("utf-8")) % 999999)
+
+
 def _infer_surface(tourney_name: str) -> str:
     name = (tourney_name or "").lower()
-    clay_keywords = [
+    clay = [
         "roland garros", "french open", "madrid", "rome", "internazionali",
         "monte-carlo", "monte carlo", "barcelona", "hamburg", "bastad",
         "gstaad", "kitzbuhel", "umag", "palermo", "rabat", "strasbourg",
         "charleston", "bogota", "rio", "buenos aires", "santiago", "estoril",
         "lyon", "geneva", "munich", "marrakech", "bucharest", "houston", "iasi"
     ]
-    grass_keywords = [
+    grass = [
         "wimbledon", "halle", "queen", "eastbourne", "mallorca",
         "hertogenbosch", "stuttgart", "bad homburg", "nottingham", "birmingham", "berlin"
     ]
-    if any(k in name for k in clay_keywords):
+    if any(k in name for k in clay):
         return "Clay"
-    if any(k in name for k in grass_keywords):
+    if any(k in name for k in grass):
         return "Grass"
     return "Hard"
 
@@ -33,13 +44,22 @@ def _infer_level(tourney_name: str) -> str:
     return "A"
 
 
-def fetch_espn_matches(min_date_int: int = 20260601) -> pd.DataFrame:
-    """Fetches completed ATP & WTA singles matches from ESPN's public scoreboard API."""
+def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
+    """Fetches completed ATP & WTA singles matches from ESPN using YYYYMMDD-YYYYMMDD ranges."""
     now = datetime.now(timezone.utc)
-    months = []
-    y, m = 2026, 6
+    start_year = min_date_int // 10000
+    start_month = (min_date_int // 100) % 100
+
+    date_ranges = []
+    y, m = start_year, start_month
     while (y, m) <= (now.year, now.month):
-        months.append(f"{y}{m:02d}")
+        last_day = calendar.monthrange(y, m)[1]
+        start_str = f"{y}{m:02d}01"
+        if (y, m) == (now.year, now.month):
+            end_str = f"{now.year}{now.month:02d}{now.day:02d}"
+        else:
+            end_str = f"{y}{m:02d}{last_day:02d}"
+        date_ranges.append(f"{start_str}-{end_str}")
         m += 1
         if m > 12:
             m = 1
@@ -49,78 +69,90 @@ def fetch_espn_matches(min_date_int: int = 20260601) -> pd.DataFrame:
     seen = set()
 
     for slug, tour_label in [("atp", "ATP"), ("wta", "WTA")]:
-        for ym in months:
-            url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{slug}/scoreboard?dates={ym}"
+        for dr in date_ranges:
+            url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{slug}/scoreboard?dates={dr}&limit=100"
             try:
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=20) as resp:
                     payload = json.loads(resp.read().decode("utf-8"))
             except Exception as exc:
-                print(f"[ESPN] Skipped {tour_label} {ym}: {exc}")
+                print(f"Skipping ESPN {tour_label} {dr} ({exc})")
                 continue
 
             for event in payload.get("events", []):
-                t_name = event.get("name", "ATP/WTA Event")
+                t_name = event.get("name", f"{tour_label} Event")
+                t_id = f"ESPN-{dr[:6]}-{event.get('id', '0')}"
                 surface = _infer_surface(t_name)
                 level = _infer_level(t_name)
+                match_counter = 0
 
-                for grp in event.get("groupings", []):
-                    draw_name = grp.get("grouping", {}).get("displayName", "")
-                    if "Singles" not in draw_name:
+                comps = []
+                groups = event.get("groupings", [])
+                if groups:
+                    for grp in groups:
+                        draw_name = grp.get("grouping", {}).get("displayName", "")
+                        if "Singles" not in draw_name:
+                            continue
+                        comps.extend(grp.get("competitions", []))
+                else:
+                    comps.extend(event.get("competitions", []))
+
+                for comp in comps:
+                    if not comp.get("status", {}).get("type", {}).get("completed", False):
                         continue
 
-                    for comp in grp.get("competitions", []):
-                        status_type = comp.get("status", {}).get("type", {})
-                        if not status_type.get("completed", False):
-                            continue
+                    competitors = comp.get("competitors", [])
+                    if len(competitors) != 2:
+                        continue
 
-                        competitors = comp.get("competitors", [])
-                        if len(competitors) != 2:
-                            continue
+                    winner_obj = next((c for c in competitors if c.get("winner") is True), None)
+                    loser_obj = next((c for c in competitors if c.get("winner") is False), None)
+                    if not winner_obj or not loser_obj:
+                        continue
 
-                        winner_obj = next((c for c in competitors if c.get("winner") is True), None)
-                        loser_obj = next((c for c in competitors if c.get("winner") is False), None)
-                        if not winner_obj or not loser_obj:
-                            continue
+                    w_name = (winner_obj.get("athlete") or winner_obj.get("team") or {}).get("displayName", "")
+                    l_name = (loser_obj.get("athlete") or loser_obj.get("team") or {}).get("displayName", "")
+                    if not w_name or not l_name or "TBD" in (w_name, l_name):
+                        continue
 
-                        w_name = (winner_obj.get("athlete") or winner_obj.get("team") or {}).get("displayName")
-                        l_name = (loser_obj.get("athlete") or loser_obj.get("team") or {}).get("displayName")
-                        if not w_name or not l_name:
-                            continue
+                    raw_date = (comp.get("date") or "")[:10].replace("-", "")
+                    if not raw_date.isdigit():
+                        continue
+                    date_int = int(raw_date)
+                    if date_int <= min_date_int:
+                        continue
 
-                        raw_date = (comp.get("date") or "")[:10].replace("-", "")
-                        if not raw_date.isdigit():
-                            continue
-                        date_int = int(raw_date)
-                        if date_int <= min_date_int:
-                            continue
+                    dedup_key = (tour_label, date_int, _norm_name(w_name), _norm_name(l_name))
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
 
-                        key = (tour_label, date_int, w_name, l_name)
-                        if key in seen:
-                            continue
-                        seen.add(key)
+                    match_counter += 1
+                    w_id = name_to_id.get((tour_label, _norm_name(w_name)), _fallback_id(w_name))
+                    l_id = name_to_id.get((tour_label, _norm_name(l_name)), _fallback_id(l_name))
 
-                        w_rank = (winner_obj.get("curatedRank") or {}).get("current")
-                        l_rank = (loser_obj.get("curatedRank") or {}).get("current")
-                        round_name = (comp.get("round") or {}).get("displayName") or "R32"
-
-                        rows.append({
-                            "tourney_id": f"ESPN-{ym}-{event.get('id', '')}",
-                            "tourney_name": t_name,
-                            "surface": surface,
-                            "tourney_level": level,
-                            "tourney_date": date_int,
-                            "winner_name": w_name,
-                            "loser_name": l_name,
-                            "winner_rank": w_rank,
-                            "loser_rank": l_rank,
-                            "round": round_name,
-                            "tour": tour_label,
-                        })
+                    rows.append({
+                        "tourney_id": t_id,
+                        "tourney_name": t_name,
+                        "surface": surface,
+                        "tourney_level": level,
+                        "tourney_date": date_int,
+                        "match_num": match_counter,
+                        "winner_id": w_id,
+                        "winner_name": w_name,
+                        "winner_hand": None,
+                        "winner_rank": (winner_obj.get("curatedRank") or {}).get("current"),
+                        "loser_id": l_id,
+                        "loser_name": l_name,
+                        "loser_hand": None,
+                        "loser_rank": (loser_obj.get("curatedRank") or {}).get("current"),
+                        "round": (comp.get("round") or {}).get("displayName") or "R32",
+                        "tour": tour_label,
+                    })
 
     if not rows:
         return pd.DataFrame()
 
-    df = pd.DataFrame(rows).sort_values("tourney_date").reset_index(drop=True)
-    print(f"[ESPN] Fetched {len(df)} new completed {min_date_int}+ ATP/WTA singles matches!")
+    df = pd.DataFrame(rows)
+    print(f"Loaded ESPN live matches (> {min_date_int}): {len(df)} matches")
     return df
