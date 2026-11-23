@@ -57,6 +57,27 @@ def _is_valid_singles_draw(draw_name: str, tour_label: str) -> bool:
     return True
 
 
+def _format_score(winner_obj: dict, loser_obj: dict, status_detail: str) -> str:
+    w_sets = winner_obj.get("linescores") or []
+    l_sets = loser_obj.get("linescores") or []
+    parts = []
+    for sw, sl in zip(w_sets, l_sets):
+        wg = sw.get("value")
+        lg = sl.get("value")
+        if wg is None or lg is None:
+            continue
+        set_str = f"{int(wg)}-{int(lg)}"
+        tb_vals = [int(x) for x in (sw.get("tiebreak"), sl.get("tiebreak")) if x is not None]
+        if tb_vals:
+            set_str += f"({min(tb_vals)})"
+        parts.append(set_str)
+    if parts:
+        if "ret" in (status_detail or "").lower():
+            parts.append("RET")
+        return " ".join(parts)
+    return status_detail or ""
+
+
 def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
     """Fetches completed ATP & WTA singles matches from ESPN using YYYYMMDD-YYYYMMDD ranges."""
     now = datetime.now(timezone.utc)
@@ -112,7 +133,8 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
                     comps.extend(event.get("competitions", []))
 
                 for comp in comps:
-                    if not comp.get("status", {}).get("type", {}).get("completed", False):
+                    status_type = comp.get("status", {}).get("type", {})
+                    if not status_type.get("completed", False):
                         continue
 
                     competitors = comp.get("competitors", [])
@@ -151,6 +173,7 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
                     match_counter += 1
                     w_id = name_to_id.get((tour_label, nw), _fallback_id(w_name))
                     l_id = name_to_id.get((tour_label, nl), _fallback_id(l_name))
+                    score_str = _format_score(winner_obj, loser_obj, status_type.get("shortDetail", ""))
 
                     rows.append({
                         "tourney_id": t_id,
@@ -167,6 +190,7 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
                         "loser_name": l_name,
                         "loser_hand": None,
                         "loser_rank": (loser_obj.get("curatedRank") or {}).get("current"),
+                        "score": score_str,
                         "round": (comp.get("round") or {}).get("displayName") or "R32",
                         "tour": tour_label,
                     })

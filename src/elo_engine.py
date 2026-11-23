@@ -12,7 +12,7 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 ARCHIVE_BASE = "https://raw.githubusercontent.com/Aneeshers/tennis-sackmann-archive/main"
-YEARS = range(2015, 2027)  # 2015 through 2026
+YEARS = range(2015, 2027)
 
 
 def load_historical_matches() -> pd.DataFrame:
@@ -30,13 +30,11 @@ def load_historical_matches() -> pd.DataFrame:
 
     matches = pd.concat(frames, ignore_index=True)
 
-    # Map existing (tour, player_name) -> Sackmann player_id so ESPN matches update existing players
     name_to_id = {}
     for row in matches[["tour", "winner_name", "winner_id", "loser_name", "loser_id"]].dropna().itertuples(index=False):
         name_to_id[(row.tour, _norm_name(str(row.winner_name)))] = int(float(row.winner_id))
         name_to_id[(row.tour, _norm_name(str(row.loser_name)))] = int(float(row.loser_id))
 
-    # Append live completed ATP & WTA singles matches from ESPN after the archive's latest date
     archive_dates = pd.to_numeric(matches["tourney_date"], errors="coerce").dropna()
     if not archive_dates.empty:
         max_archive_date = int(archive_dates.max())
@@ -51,11 +49,9 @@ def load_historical_matches() -> pd.DataFrame:
     matches["loser_id"] = pd.to_numeric(matches["loser_id"], errors="coerce")
     matches = matches.dropna(subset=["tourney_date", "winner_id", "loser_id"])
 
-    # Prefix IDs so ATP and WTA player IDs never collide in a unified table
     matches["winner_uid"] = matches["tour"].str.lower() + "_" + matches["winner_id"].astype(int).astype(str)
     matches["loser_uid"] = matches["tour"].str.lower() + "_" + matches["loser_id"].astype(int).astype(str)
 
-    # Sort strictly chronologically so Elo updates never leak future results
     matches = matches.sort_values(["tourney_date", "tourney_id", "match_num"]).reset_index(drop=True)
     return matches
 
@@ -89,7 +85,6 @@ def compute_elo_ratings(matches: pd.DataFrame):
         surf = row.surface if row.surface in surface_elo else None
         level = getattr(row, "tourney_level", "")
 
-        # 1. Record PRE-MATCH ratings (used later as ML training features)
         w_ov = overall_elo[w_id]
         l_ov = overall_elo[l_id]
         pre_w_elo.append(w_ov)
@@ -103,14 +98,12 @@ def compute_elo_ratings(matches: pd.DataFrame):
         pre_w_surf.append(w_sf)
         pre_l_surf.append(l_sf)
 
-        # 2. Update OVERALL Elo
         exp_w = expected_score(w_ov, l_ov)
         k_w = k_factor(match_counts[w_id], level)
         k_l = k_factor(match_counts[l_id], level)
         overall_elo[w_id] = w_ov + k_w * (1.0 - exp_w)
         overall_elo[l_id] = l_ov + k_l * (0.0 - (1.0 - exp_w))
 
-        # 3. Update SURFACE Elo
         if surf:
             exp_w_sf = expected_score(w_sf, l_sf)
             surface_elo[surf][w_id] = w_sf + k_w * (1.0 - exp_w_sf)
@@ -126,10 +119,10 @@ def compute_elo_ratings(matches: pd.DataFrame):
         player_meta[w_id] = (row.tour, row.winner_name, w_hand if pd.notna(w_hand) else prev_w_hand)
         player_meta[l_id] = (row.tour, row.loser_name, l_hand if pd.notna(l_hand) else prev_l_hand)
 
-    matches["w_pre_elo"] = pre_w_elo
-    matches["l_pre_elo"] = pre_l_elo
-    matches["w_pre_surf_elo"] = pre_w_surf
-    matches["l_pre_surf_elo"] = pre_l_surf
+    matches["w_pre_elo"] = [round(x, 1) for x in pre_w_elo]
+    matches["l_pre_elo"] = [round(x, 1) for x in pre_l_elo]
+    matches["w_pre_surf_elo"] = [round(x, 1) for x in pre_w_surf]
+    matches["l_pre_surf_elo"] = [round(x, 1) for x in pre_l_surf]
 
     players_rows = []
     for pid, (tour, name, hand) in player_meta.items():
@@ -160,12 +153,46 @@ def upload_players_to_supabase(players_df: pd.DataFrame, batch_size: int = 500):
     print(f"Successfully upserted {len(records)} players to Supabase.")
 
 
+def upload_matches_to_supabase(matches_df: pd.DataFrame, batch_size: int = 1000):
+    df = matches_df.copy()
+    df["tourney_date"] = df["tourney_date"].astype(str).str[:10]
+    t_id = df["tourney_id"].fillna("UNK").astype(str).str.strip()
+    m_num = pd.to_numeric(df.get("match_num", 0), errors="coerce").fillna(0).astype(int).astype(str)
+    df["match_id"] = (
+        df["tour"].astype(str) + "_"
+        + df["tourney_date"] + "_"
+        + t_id + "_"
+        + m_num + "_"
+        + df["winner_uid"].astype(str) + "_"
+        + df["loser_uid"].astype(str)
+    )
+    df = df.drop_duplicates(subset=["match_id"], keep="last")
+
+    keep_cols = [
+        "match_id", "tourney_date", "tour", "tourney_name", "surface", "round",
+        "winner_uid", "winner_name", "loser_uid", "loser_name",
+        "score", "w_pre_elo", "l_pre_elo",
+    ]
+    for col in keep_cols:
+        if col not in df.columns:
+            df[col] = None
+
+    raw_records = df[keep_cols].to_dict(orient="records")
+    records = [
+        {k: (None if pd.isna(v) else v) for k, v in row.items()}
+        for row in raw_records
+    ]
+    total_batches = (len(records) + batch_size - 1) // batch_size
+    for idx, i in enumerate(range(0, len(records), batch_size), start=1):
+        batch = records[i : i + batch_size]
+        supabase.table("matches").upsert(batch).execute()
+        if idx % 15 == 0 or idx == total_batches:
+            print(f"Uploaded matches batch {idx}/{total_batches}...")
+    print(f"Successfully upserted {len(records)} matches to Supabase.")
+
+
 if __name__ == "__main__":
-    os.makedirs("data", exist_ok=True)
     matches_df = load_historical_matches()
     enriched_matches, players_df = compute_elo_ratings(matches_df)
-
-    enriched_matches.to_csv("data/historical_matches_elo.csv", index=False)
-    print("Saved local training dataset to data/historical_matches_elo.csv")
-
     upload_players_to_supabase(players_df)
+    upload_matches_to_supabase(enriched_matches)
