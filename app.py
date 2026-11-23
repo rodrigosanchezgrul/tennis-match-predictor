@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 import joblib
 import numpy as np
@@ -44,6 +44,51 @@ def load_players() -> pd.DataFrame:
         start += step
     df = pd.DataFrame(all_rows)
     return df.sort_values("elo_overall", ascending=False).reset_index(drop=True)
+
+
+@st.cache_data(ttl=600)
+def load_player_matches(player_uid: str) -> pd.DataFrame:
+    """Fetches all career matches (2015-present) for one player from Supabase."""
+    sb = get_supabase()
+    all_rows = []
+    start = 0
+    step = 1000
+    while True:
+        res = (
+            sb.table("matches")
+            .select("*")
+            .or_(f"winner_uid.eq.{player_uid},loser_uid.eq.{player_uid}")
+            .order("tourney_date", desc=True)
+            .range(start, start + step - 1)
+            .execute()
+        )
+        if not res.data:
+            break
+        all_rows.extend(res.data)
+        if len(res.data) < step:
+            break
+        start += step
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    raw = pd.DataFrame(all_rows)
+    won = raw["winner_uid"] == player_uid
+
+    formatted = pd.DataFrame({
+        "Date": raw["tourney_date"].astype(str).str[:10],
+        "Result": np.where(won, "✅ W", "❌ L"),
+        "Won": won,
+        "Opponent": np.where(won, raw["loser_name"], raw["winner_name"]),
+        "Opponent_UID": np.where(won, raw["loser_uid"], raw["winner_uid"]),
+        "Score": raw["score"].fillna(""),
+        "Tournament": raw["tourney_name"].fillna(""),
+        "Surface": raw["surface"].fillna("Hard"),
+        "Round": raw["round"].fillna(""),
+        "Player Elo": pd.to_numeric(np.where(won, raw["w_pre_elo"], raw["l_pre_elo"]), errors="coerce"),
+        "Opp Elo": pd.to_numeric(np.where(won, raw["l_pre_elo"], raw["w_pre_elo"]), errors="coerce"),
+    })
+    return formatted.sort_values("Date", ascending=False).reset_index(drop=True)
 
 
 @st.cache_data
@@ -127,15 +172,16 @@ leaderboard_df = load_leaderboard()
 feature_cols = load_feature_cols()
 pipelines = load_all_pipelines(leaderboard_df["full_label"].tolist())
 
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔮 Live Match Predictor",
     "🏆 Model Leaderboard & Overfitting Lab",
     "📈 Diagnostic Graphs & Learning Curves",
     "📊 ATP / WTA Elo Rankings",
+    "📋 Player Match History",
 ])
 
 # ------------------------------------------------------------------------------
-# TAB 1: LIVE MATCH PREDICTOR (ALL MODELS SIDE-BY-SIDE)
+# TAB 1: LIVE MATCH PREDICTOR (ALL MODELS SIDE-BY-SIDE + RECENT FORM)
 # ------------------------------------------------------------------------------
 with tab1:
     st.subheader("Head-to-Head Matchup Simulator")
@@ -160,7 +206,6 @@ with tab1:
         p2_row = tour_players[tour_players["player_name"] == p2_name].iloc[0]
         X_match = build_matchup_row(p1_row, p2_row, tour, surface, best_of, feature_cols)
 
-        # Primary model prediction
         p1_prob = predict_prob_single(pipelines[primary_model], X_match)
         p2_prob = 1.0 - p1_prob
 
@@ -178,6 +223,44 @@ with tab1:
                 label=f"{p2_name} (Overall Elo: {p2_row['elo_overall']:.0f} | {surface}: {p2_row[f'elo_{surface.lower()}']:.0f})",
                 value=f"{p2_prob:.1%} Win Chance",
             )
+
+        # Recent Form & Head-to-Head Preview
+        p1_hist = load_player_matches(p1_row["player_id"])
+        p2_hist = load_player_matches(p2_row["player_id"])
+
+        if not p1_hist.empty and not p2_hist.empty:
+            h2h = p1_hist[p1_hist["Opponent_UID"] == p2_row["player_id"]]
+            p1_h2h_wins = int(h2h["Won"].sum()) if not h2h.empty else 0
+            p2_h2h_wins = len(h2h) - p1_h2h_wins
+
+            st.subheader(f"Recent Form & Head-to-Head ({p1_name} {p1_h2h_wins} – {p2_h2h_wins} {p2_name})")
+            if not h2h.empty:
+                with st.expander(f"View All {len(h2h)} Head-to-Head Meetings (2015–Present)"):
+                    st.dataframe(
+                        h2h[["Date", "Result", "Score", "Tournament", "Surface", "Round"]],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            rc1, rc2 = st.columns(2)
+            with rc1:
+                last10_p1 = p1_hist.head(10)
+                w10_1 = int(last10_p1["Won"].sum())
+                st.markdown(f"**{p1_name} — Latest 10 Matches ({w10_1}W – {len(last10_p1) - w10_1}L)**")
+                st.dataframe(
+                    last10_p1[["Date", "Result", "Opponent", "Score", "Surface", "Tournament"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            with rc2:
+                last10_p2 = p2_hist.head(10)
+                w10_2 = int(last10_p2["Won"].sum())
+                st.markdown(f"**{p2_name} — Latest 10 Matches ({w10_2}W – {len(last10_p2) - w10_2}L)**")
+                st.dataframe(
+                    last10_p2[["Date", "Result", "Opponent", "Score", "Surface", "Tournament"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
         # All 12 Models Consensus Chart
         st.subheader("How All 12 Trained Models Vote on This Match")
@@ -224,7 +307,6 @@ with tab2:
     )
     filtered_lb = leaderboard_df[leaderboard_df["feature_mode"].isin(mode_filter)].copy()
 
-    # Interactive Train vs Test Accuracy Chart
     fig_gap = go.Figure()
     fig_gap.add_trace(go.Bar(
         name="Train Accuracy (2016-2024)",
@@ -309,3 +391,83 @@ with tab4:
         view_df[["player_name", "tour", "hand", "matches_played", "elo_overall", "elo_hard", "elo_clay", "elo_grass"]],
         use_container_width=True,
     )
+
+# ------------------------------------------------------------------------------
+# TAB 5: PLAYER MATCH HISTORY & ELO EVOLUTION
+# ------------------------------------------------------------------------------
+with tab5:
+    st.subheader("Player Match History & Elo Progression (2015–Present)")
+
+    hc1, hc2, hc3, hc4 = st.columns([1, 2, 1, 1])
+    hist_tour = hc1.selectbox("Tour", ["ATP", "WTA"], key="hist_tour")
+    hist_tour_players = players_df[players_df["tour"] == hist_tour].reset_index(drop=True)
+    hist_player_name = hc2.selectbox("Select Player", hist_tour_players["player_name"].tolist(), key="hist_player")
+    hist_limit = hc3.selectbox("Show Games", ["Latest 15", "Latest 50", "All Career Matches"], index=0)
+    hist_surface = hc4.selectbox("Surface Filter", ["ALL", "Hard", "Clay", "Grass"], key="hist_surf")
+
+    sel_player = hist_tour_players[hist_tour_players["player_name"] == hist_player_name].iloc[0]
+    match_log = load_player_matches(sel_player["player_id"])
+
+    if match_log.empty:
+        st.info("No matches found for this player yet.")
+    else:
+        # Summary KPIs
+        total_w = int(match_log["Won"].sum())
+        total_l = len(match_log) - total_w
+        win_pct = (total_w / len(match_log)) * 100 if len(match_log) else 0.0
+        last10 = match_log.head(10)
+        l10_w = int(last10["Won"].sum())
+
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Career Record (2015–Now)", f"{total_w}W – {total_l}L", f"{win_pct:.1f}% Win Rate")
+        k2.metric("Latest 10 Matches", f"{l10_w}W – {len(last10) - l10_w}L")
+        k3.metric("Current Overall Elo", f"{sel_player['elo_overall']:.0f}")
+        k4.metric(
+            "Surface Elo (H / C / G)",
+            f"{sel_player['elo_hard']:.0f} / {sel_player['elo_clay']:.0f} / {sel_player['elo_grass']:.0f}",
+        )
+
+        # Elo Progression Chart
+        elo_series = match_log.dropna(subset=["Player Elo"]).iloc[::-1].copy()
+        if len(elo_series) > 1:
+            fig_elo = px.line(
+                elo_series,
+                x="Date",
+                y="Player Elo",
+                hover_data=["Result", "Opponent", "Score", "Tournament", "Surface"],
+                title=f"{hist_player_name} — Pre-Match Elo Rating Over Time",
+            )
+            fig_elo.update_traces(line_color="#1f77b4", line_width=2)
+            fig_elo.update_layout(height=320, margin=dict(l=20, r=20, t=45, b=20))
+            st.plotly_chart(fig_elo, use_container_width=True)
+
+        # Filter & Display Match Table
+        sf1, sf2 = st.columns([1, 2])
+        result_filter = sf1.radio("Result Filter", ["All", "Wins Only", "Losses Only"], horizontal=True)
+        opp_search = sf2.text_input("Filter by Opponent or Tournament", "", key="hist_search")
+
+        filtered_log = match_log.copy()
+        if hist_surface != "ALL":
+            filtered_log = filtered_log[filtered_log["Surface"] == hist_surface]
+        if result_filter == "Wins Only":
+            filtered_log = filtered_log[filtered_log["Won"]]
+        elif result_filter == "Losses Only":
+            filtered_log = filtered_log[~filtered_log["Won"]]
+        if opp_search.strip():
+            q = opp_search.strip()
+            filtered_log = filtered_log[
+                filtered_log["Opponent"].str.contains(q, case=False, na=False)
+                | filtered_log["Tournament"].str.contains(q, case=False, na=False)
+            ]
+
+        if hist_limit == "Latest 15":
+            filtered_log = filtered_log.head(15)
+        elif hist_limit == "Latest 50":
+            filtered_log = filtered_log.head(50)
+
+        st.caption(f"Showing {len(filtered_log)} matches")
+        st.dataframe(
+            filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]],
+            use_container_width=True,
+            hide_index=True,
+        )
