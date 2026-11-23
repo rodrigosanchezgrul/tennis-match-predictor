@@ -443,7 +443,7 @@ with tab_today:
             dm1, dm2, dm3 = st.columns([2, 1, 2])
             with dm1:
                 st.metric(
-                    label=f"{sel_m['Player1']} (Elo: {sel_p1['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p1[f'elo_{sel_m[\"Surface\"].lower()}']:.0f})",
+                    label=f"{sel_m['Player1']} (Elo: {sel_p1['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p1[f"elo_{sel_m['Surface'].lower()}"]:.0f})",
                     value=f"{sel_prob1:.1%} Win Chance",
                 )
             with dm2:
@@ -453,7 +453,7 @@ with tab_today:
                 )
             with dm3:
                 st.metric(
-                    label=f"{sel_m['Player2']} (Elo: {sel_p2['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p2[f'elo_{sel_m[\"Surface\"].lower()}']:.0f})",
+                    label=f"{sel_m['Player2']} (Elo: {sel_p2['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p2[f"elo_{sel_m['Surface'].lower()}"]:.0f})",
                     value=f"{(1.0 - sel_prob1):.1%} Win Chance",
                 )
 
@@ -759,3 +759,4 @@ with tab5:
             use_container_width=True,
             hide_index=True,
         )
+
