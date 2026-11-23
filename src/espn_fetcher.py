@@ -44,6 +44,19 @@ def _infer_level(tourney_name: str) -> str:
     return "A"
 
 
+def _is_valid_singles_draw(draw_name: str, tour_label: str) -> bool:
+    d = (draw_name or "").lower()
+    if "singles" not in d:
+        return False
+    if any(x in d for x in ["wheelchair", "junior", "boy", "girl", "quad", "legend"]):
+        return False
+    if tour_label == "ATP" and "women" in d:
+        return False
+    if tour_label == "WTA" and re.search(r"\bmen('s)?\b", d):
+        return False
+    return True
+
+
 def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
     """Fetches completed ATP & WTA singles matches from ESPN using YYYYMMDD-YYYYMMDD ranges."""
     now = datetime.now(timezone.utc)
@@ -67,6 +80,7 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
 
     rows = []
     seen = set()
+    opp_tour = {"ATP": "WTA", "WTA": "ATP"}
 
     for slug, tour_label in [("atp", "ATP"), ("wta", "WTA")]:
         for dr in date_ranges:
@@ -91,7 +105,7 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
                 if groups:
                     for grp in groups:
                         draw_name = grp.get("grouping", {}).get("displayName", "")
-                        if "Singles" not in draw_name:
+                        if not _is_valid_singles_draw(draw_name, tour_label):
                             continue
                         comps.extend(grp.get("competitions", []))
                 else:
@@ -115,6 +129,13 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
                     if not w_name or not l_name or "TBD" in (w_name, l_name):
                         continue
 
+                    nw, nl = _norm_name(w_name), _norm_name(l_name)
+                    other = opp_tour[tour_label]
+                    if ((tour_label, nw) not in name_to_id and (other, nw) in name_to_id) or (
+                        (tour_label, nl) not in name_to_id and (other, nl) in name_to_id
+                    ):
+                        continue
+
                     raw_date = (comp.get("date") or "")[:10].replace("-", "")
                     if not raw_date.isdigit():
                         continue
@@ -122,14 +143,14 @@ def fetch_espn_matches(min_date_int: int, name_to_id: dict) -> pd.DataFrame:
                     if date_int <= min_date_int:
                         continue
 
-                    dedup_key = (tour_label, date_int, _norm_name(w_name), _norm_name(l_name))
+                    dedup_key = (tour_label, date_int, nw, nl)
                     if dedup_key in seen:
                         continue
                     seen.add(dedup_key)
 
                     match_counter += 1
-                    w_id = name_to_id.get((tour_label, _norm_name(w_name)), _fallback_id(w_name))
-                    l_id = name_to_id.get((tour_label, _norm_name(l_name)), _fallback_id(l_name))
+                    w_id = name_to_id.get((tour_label, nw), _fallback_id(w_name))
+                    l_id = name_to_id.get((tour_label, nl), _fallback_id(l_name))
 
                     rows.append({
                         "tourney_id": t_id,
