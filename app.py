@@ -186,6 +186,8 @@ def load_players() -> pd.DataFrame:
     for col, default in [
         ("ranking_points", 0), ("grand_slams", 0), ("masters_1000", 0),
         ("total_titles", 0), ("form_10", 0.5), ("matches_14d", 0),
+        ("srv_won_20", 0.62), ("ret_won_20", 0.38), ("bp_saved_20", 0.60),
+        ("dom_ratio_20", 1.00), ("straight_set_20", 0.50), ("days_inactive", 7),
     ]:
         if col not in df.columns:
             df[col] = default
@@ -328,6 +330,12 @@ def explain_matchup_drivers(pipeline, X_row: pd.DataFrame, p1, p2, p1_name: str,
             {"fatigue14_diff": 0.0},
             f"{int(p1.get('matches_14d', 0))} matches",
             f"{int(p2.get('matches_14d', 0))} matches",
+        ),
+        (
+            "Serve & Return Dominance (L20)",
+            {"srv_diff": 0.0, "ret_diff": 0.0, "dom_ratio_diff": 0.0, "bp_saved_diff": 0.0, "straight_set_diff": 0.0},
+            f"Srv {float(p1.get('srv_won_20', 0.62)):.1%} • Ret {float(p1.get('ret_won_20', 0.38)):.1%}",
+            f"Srv {float(p2.get('srv_won_20', 0.62)):.1%} • Ret {float(p2.get('ret_won_20', 0.38)):.1%}",
         ),
     ]
 
@@ -491,6 +499,12 @@ def build_matchup_row(p1, p2, tour: str, surface: str, best_of: int, feature_col
         "titles_diff": p1_tit - p2_tit,
         "form10_diff": p1_f10 - p2_f10,
         "fatigue14_diff": p1_m14 - p2_m14,
+        "srv_diff": float(p1.get("srv_won_20", 0.62)) - float(p2.get("srv_won_20", 0.62)),
+        "ret_diff": float(p1.get("ret_won_20", 0.38)) - float(p2.get("ret_won_20", 0.38)),
+        "bp_saved_diff": float(p1.get("bp_saved_20", 0.60)) - float(p2.get("bp_saved_20", 0.60)),
+        "dom_ratio_diff": float(p1.get("dom_ratio_20", 1.00)) - float(p2.get("dom_ratio_20", 1.00)),
+        "straight_set_diff": float(p1.get("straight_set_20", 0.50)) - float(p2.get("straight_set_20", 0.50)),
+        "inactivity_diff": float(p1.get("days_inactive", 7)) - float(p2.get("days_inactive", 7)),
         "is_atp": 1 if tour == "ATP" else 0,
         "best_of": best_of,
         "surf_hard": 1 if surface == "Hard" else 0,
@@ -857,6 +871,7 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
 
 
 
