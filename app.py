@@ -276,6 +276,154 @@ def predict_prob_single(pipeline, X_row: pd.DataFrame) -> float:
     return float(np.clip(pipeline.predict(X_row)[0], 0.0, 1.0))
 
 
+def explain_matchup_drivers(pipeline, X_row: pd.DataFrame, p1, p2, p1_name: str, p2_name: str, surface: str, p1_hist: pd.DataFrame, p2_hist: pd.DataFrame):
+    """Computes per-match feature impact (% win prob shift) + Head-to-Head & Overall Win Rate comparison."""
+    base_prob = predict_prob_single(pipeline, X_row)
+    surf_col = f"elo_{surface.lower()}"
+
+    # Neutralize each conceptual group to parity (both players equal to midpoint) to measure exact local impact
+    mid_elo = (float(p1["elo_overall"]) + float(p2["elo_overall"])) / 2.0
+    mid_surf = (float(p1[surf_col]) + float(p2[surf_col])) / 2.0
+    mid_age = (float(p1.get("age", 26.0)) + float(p2.get("age", 26.0))) / 2.0
+
+    groups = [
+        (
+            "Overall Elo Rating",
+            {"elo_diff": 0.0, "elo_win_prob": 0.5, "p1_elo": mid_elo, "p2_elo": mid_elo},
+            f"{p1['elo_overall']:.0f}",
+            f"{p2['elo_overall']:.0f}",
+        ),
+        (
+            f"{surface} Court Elo",
+            {"surf_elo_diff": 0.0, "surf_elo_win_prob": 0.5, "p1_surf_elo": mid_surf, "p2_surf_elo": mid_surf},
+            f"{p1[surf_col]:.0f}",
+            f"{p2[surf_col]:.0f}",
+        ),
+        (
+            "52-Week Ranking Points",
+            {"pts_diff": 0.0, "log_pts_ratio": 0.0},
+            f"{int(p1.get('ranking_points', 0)):,} pts",
+            f"{int(p2.get('ranking_points', 0)):,} pts",
+        ),
+        (
+            "Career Titles (GS / M1000)",
+            {"slam_diff": 0.0, "masters_diff": 0.0, "titles_diff": 0.0},
+            f"{int(p1.get('grand_slams', 0))} GS • {int(p1.get('masters_1000', 0))} M1000 ({int(p1.get('total_titles', 0))} tot)",
+            f"{int(p2.get('grand_slams', 0))} GS • {int(p2.get('masters_1000', 0))} M1000 ({int(p2.get('total_titles', 0))} tot)",
+        ),
+        (
+            "Player Age & Peak Curve",
+            {"age_diff": 0.0, "p1_age": mid_age, "p2_age": mid_age, "p1_peak_dist": abs(mid_age - 26.0), "p2_peak_dist": abs(mid_age - 26.0)},
+            f"{float(p1.get('age', 26.0)):.1f} yrs",
+            f"{float(p2.get('age', 26.0)):.1f} yrs",
+        ),
+        (
+            "Recent Form (Last 10)",
+            {"form10_diff": 0.0},
+            f"{float(p1.get('form_10', 0.5)):.0%} win rate",
+            f"{float(p2.get('form_10', 0.5)):.0%} win rate",
+        ),
+        (
+            "14-Day Match Load",
+            {"fatigue14_diff": 0.0},
+            f"{int(p1.get('matches_14d', 0))} matches",
+            f"{int(p2.get('matches_14d', 0))} matches",
+        ),
+    ]
+
+    driver_rows = []
+    for label, overrides, p1_disp, p2_disp in groups:
+        X_cf = X_row.copy()
+        for col, val in overrides.items():
+            if col in X_cf.columns:
+                X_cf[col] = val
+        cf_prob = predict_prob_single(pipeline, X_cf)
+        shift_pct = (base_prob - cf_prob) * 100.0  # + favors P1, - favors P2
+        if abs(shift_pct) < 0.05:
+            fav = "Even"
+        elif shift_pct > 0:
+            fav = f"{p1_name} (+{shift_pct:.1f}%)"
+        else:
+            fav = f"{p2_name} (+{abs(shift_pct):.1f}%)"
+        driver_rows.append({
+            "Factor": label,
+            p1_name: p1_disp,
+            p2_name: p2_disp,
+            "Model Edge": fav,
+            "P1_Shift": round(shift_pct, 2),
+            "Abs_Impact": abs(shift_pct),
+        })
+
+    # Add historical Head-to-Head & Career Overall Win Rate from matches table
+    p1_uid = p1.get("player_id", "")
+    p2_uid = p2.get("player_id", "")
+    if not p1_hist.empty and p2_uid:
+        h2h = p1_hist[p1_hist["Opponent_UID"] == p2_uid]
+        h2h_w1 = int(h2h["Won"].sum()) if not h2h.empty else 0
+        h2h_w2 = len(h2h) - h2h_w1
+    else:
+        h2h_w1, h2h_w2 = 0, 0
+
+    h2h_edge = "Even (0–0)" if (h2h_w1 == h2h_w2) else (f"{p1_name} ({h2h_w1}–{h2h_w2})" if h2h_w1 > h2h_w2 else f"{p2_name} ({h2h_w2}–{h2h_w1})")
+    driver_rows.append({
+        "Factor": "Head-to-Head (2015–Now)",
+        p1_name: f"{h2h_w1} wins",
+        p2_name: f"{h2h_w2} wins",
+        "Model Edge": h2h_edge,
+        "P1_Shift": 0.0,
+        "Abs_Impact": -1.0,
+    })
+
+    w1_tot = int(p1_hist["Won"].sum()) if not p1_hist.empty else 0
+    n1_tot = len(p1_hist)
+    w2_tot = int(p2_hist["Won"].sum()) if not p2_hist.empty else 0
+    n2_tot = len(p2_hist)
+    pct1 = (w1_tot / n1_tot * 100.0) if n1_tot else 0.0
+    pct2 = (w2_tot / n2_tot * 100.0) if n2_tot else 0.0
+    win_edge = "Even" if abs(pct1 - pct2) < 0.5 else (f"{p1_name} ({pct1:.1f}%)" if pct1 > pct2 else f"{p2_name} ({pct2:.1f}%)")
+    driver_rows.append({
+        "Factor": "Overall Career Wins (2015–Now)",
+        p1_name: f"{w1_tot}W–{n1_tot - w1_tot}L ({pct1:.1f}%)",
+        p2_name: f"{w2_tot}W–{n2_tot - w2_tot}L ({pct2:.1f}%)",
+        "Model Edge": win_edge,
+        "P1_Shift": 0.0,
+        "Abs_Impact": -2.0,
+    })
+
+    return pd.DataFrame(driver_rows)
+
+
+def render_match_drivers(pipeline, X_row, p1, p2, p1_name: str, p2_name: str, surface: str):
+    p1_hist = load_player_matches(p1.get("player_id", ""))
+    p2_hist = load_player_matches(p2.get("player_id", ""))
+    drv_df = explain_matchup_drivers(pipeline, X_row, p1, p2, p1_name, p2_name, surface, p1_hist, p2_hist)
+
+    model_only = drv_df[drv_df["Abs_Impact"] >= 0].sort_values("Abs_Impact", ascending=False).reset_index(drop=True)
+    top3 = model_only.head(3)
+    reasons = [f"**{r['Factor']}** ({r['Model Edge']})" for _, r in top3.iterrows() if r["Model Edge"] != "Even"]
+    if reasons:
+        st.info("🧠 **Principal Drivers Behind This Prediction:** " + " • ".join(reasons))
+
+    c_left, c_right = st.columns([1.3, 1])
+    with c_left:
+        st.dataframe(drv_df[["Factor", p1_name, p2_name, "Model Edge"]], use_container_width=True, hide_index=True)
+    with c_right:
+        chart_df = model_only.copy()
+        chart_df["Favors"] = np.where(chart_df["P1_Shift"] >= 0, p1_name, p2_name)
+        fig = px.bar(
+            chart_df,
+            x="P1_Shift",
+            y="Factor",
+            color="Favors",
+            orientation="h",
+            title=f"Win Probability Push (+ favors {p1_name}, − favors {p2_name})",
+            labels={"P1_Shift": "Win Probability Impact (%)"},
+        )
+        fig.add_vline(x=0, line_dash="dash", line_color="gray")
+        fig.update_layout(yaxis={"categoryorder": "total ascending"}, height=320, margin=dict(l=10, r=10, t=40, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+
+
 def build_matchup_row(p1, p2, tour: str, surface: str, best_of: int, feature_cols: list) -> pd.DataFrame:
     surf_col = f"elo_{surface.lower()}"
     p1_elo = float(p1["elo_overall"])
@@ -420,7 +568,6 @@ with tab_today:
             if fav_prob < min_conf:
                 continue
 
-            surf_key = f"elo_{m['Surface'].lower()}"
             match_label = f"[{m['Tour']}] {m['Player1']} vs {m['Player2']} — {m['Tournament']}"
             forecast_rows.append({
                 "Time / Status": m["Status"],
@@ -469,6 +616,9 @@ with tab_today:
                     delta=f"Elo {sel_p2['elo_overall']:.0f} ({sel_m['Surface']}: {sel_p2[s_col]:.0f})",
                 )
 
+            st.subheader("Why the Model Favors This Player (Key Variables)")
+            render_match_drivers(pipelines[slate_model], sel_X, sel_p1, sel_p2, sel_m["Player1"], sel_m["Player2"], sel_m["Surface"])
+
 with tab1:
     st.subheader("Head-to-Head Matchup Simulator")
     c1, c2, c3, c4 = st.columns(4)
@@ -492,7 +642,6 @@ with tab1:
         X_match = build_matchup_row(p1_row, p2_row, tour, surface, best_of, feature_cols)
         p1_prob = predict_prob_single(pipelines[primary_model], X_match)
         p2_prob = 1.0 - p1_prob
-        s_col = f"elo_{surface.lower()}"
 
         st.markdown("---")
         m1, m2, m3 = st.columns([2, 1, 2])
@@ -510,6 +659,9 @@ with tab1:
                 value=f"{p2_prob:.1%} Win Chance",
                 delta=f"Elo {p2_row['elo_overall']:.0f} • {int(p2_row['grand_slams'])} GS / {int(p2_row['masters_1000'])} M1000",
             )
+
+        st.subheader("Why the Model Favors This Player (Key Variables)")
+        render_match_drivers(pipelines[primary_model], X_match, p1_row, p2_row, p1_name, p2_name, surface)
 
         p1_hist = load_player_matches(p1_row["player_id"])
         p2_hist = load_player_matches(p2_row["player_id"])
