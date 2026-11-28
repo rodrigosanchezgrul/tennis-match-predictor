@@ -814,62 +814,86 @@ with tab_today:
             render_match_drivers(pipelines[slate_model], sel_X, sel_p1, sel_p2, sel_m["Player1"], sel_m["Player2"], sel_m["Surface"])
 
 with tab_bracket:
-    st.subheader("🏆 Interactive Tournament Bracket & Monte Carlo Predictor")
-    st.caption("Predicts every round's winner with exact ML win probabilities and runs 1,000 Monte Carlo simulations for title odds.")
+    st.subheader("🏆 Upcoming Tournament Bracket & Full Match-by-Match Predictor")
+    st.caption("Automatically loads the next upcoming ATP/WTA tournament on the calendar, forecasts every match in every round with exact win %, and predicts the champion.")
 
-    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1.3, 1.7])
+    UPCOMING_TOURNAMENTS = [
+        {"name": "Brisbane International (2027 Season Opener)", "start": "2027-01-03", "surface": "Hard", "size": 16, "best_of": 3},
+        {"name": "Adelaide International (2027 Warm-Up)", "start": "2027-01-11", "surface": "Hard", "size": 16, "best_of": 3},
+        {"name": "2027 Australian Open (First Grand Slam)", "start": "2027-01-17", "surface": "Hard", "size": 32, "best_of": 5},
+        {"name": "Indian Wells — BNP Paribas Open (Masters 1000)", "start": "2027-03-03", "surface": "Hard", "size": 32, "best_of": 3},
+        {"name": "Miami Open (Masters 1000)", "start": "2027-03-17", "surface": "Hard", "size": 32, "best_of": 3},
+        {"name": "Rolex Monte-Carlo Masters (Clay Opener)", "start": "2027-04-03", "surface": "Clay", "size": 16, "best_of": 3},
+        {"name": "2027 Roland-Garros (French Open)", "start": "2027-05-23", "surface": "Clay", "size": 32, "best_of": 5},
+        {"name": "2027 Wimbledon Championships", "start": "2027-06-28", "surface": "Grass", "size": 32, "best_of": 5},
+        {"name": "2027 US Open", "start": "2027-08-29", "surface": "Hard", "size": 32, "best_of": 5},
+    ]
+
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    future_events = [t for t in UPCOMING_TOURNAMENTS if t["start"] >= today_str] or UPCOMING_TOURNAMENTS
+    event_labels = [f"{t['name']} • Starts {t['start']} ({t['surface']})" for t in future_events]
+
+    bc1, bc2, bc3 = st.columns([1, 2.2, 1.8])
     b_tour = bc1.selectbox("Tour", ["ATP", "WTA"], key="b_tour")
-    b_size = bc2.selectbox("Bracket Size", [16, 8, 32], index=0, format_func=lambda x: f"{x}-Player Draw", key="b_size")
-    b_source = bc3.selectbox("Draw Source", ["Next Major (2027 Australian Open)", "Live ESPN Tournament (If Active)"], key="b_source")
-    b_model = bc4.selectbox("Forecasting Model", leaderboard_df["full_label"].tolist(), index=0, key="b_model")
+    chosen_ev_idx = bc2.selectbox("Next Upcoming Tournament", range(len(future_events)), format_func=lambda i: event_labels[i], index=0, key="b_ev")
+    b_model = bc3.selectbox("Forecasting Model", leaderboard_df["full_label"].tolist(), index=0, key="b_model")
 
+    ev = future_events[chosen_ev_idx]
     b_tour_df = players_df[players_df["tour"] == b_tour].copy()
-    # Rank seeds by official ranking points first, breaking ties with Elo
     b_tour_df = b_tour_df.sort_values(["ranking_points", "elo_overall"], ascending=[False, False]).reset_index(drop=True)
     top_pool = b_tour_df["player_name"].head(64).tolist()
 
-    live_draw = fetch_espn_tournament_draw(b_tour) if "ESPN" in b_source else None
+    # Check if ESPN already has an active live draw for right now
+    live_draw = fetch_espn_tournament_draw(b_tour)
     if live_draw:
-        t_title = f"{live_draw['name']} ({b_tour})"
+        custom_title = f"🔴 LIVE DRAW: {live_draw['name']} ({b_tour})"
         default_surf = live_draw["surface"]
+        default_size = 16
+        default_bo = 5 if (b_tour == "ATP" and _infer_level(live_draw["name"]) == "G") else 3
         raw_seeded = []
         for p1_e, p2_e in live_draw["pairs"]:
             for nm in (p1_e, p2_e):
                 if nm not in raw_seeded:
                     raw_seeded.append(nm)
         for nm in top_pool:
-            if len(raw_seeded) >= b_size:
+            if len(raw_seeded) >= default_size:
                 break
             if nm not in raw_seeded:
                 raw_seeded.append(nm)
-        seeded_players = raw_seeded[:b_size]
+        seeded_players = raw_seeded[:default_size]
     else:
-        if "ESPN" in b_source:
-            st.info(f"No active {b_tour} tournament draw is live on ESPN right now (off-season). Loaded projected **2027 Australian Open** seeded draw!")
-        t_title = f"2027 Australian Open — Projected {b_tour} Top-{b_size} Draw"
-        default_surf = "Hard"
-        seeded_players = top_pool[:b_size]
+        custom_title = f"{ev['name']} — {b_tour} Draw"
+        default_surf = ev["surface"]
+        default_size = ev["size"]
+        default_bo = 3 if (b_tour == "WTA" and ev["best_of"] == 5) else ev["best_of"]
+        seeded_players = top_pool[:default_size]
 
-    sc1, sc2, sc3 = st.columns([2, 1, 1])
-    custom_title = sc1.text_input("Tournament Name", value=t_title, key="b_title")
+    sc1, sc2, sc3 = st.columns([1, 1, 1])
+    b_size = sc1.selectbox("Draw Size", [8, 16, 32], index=[8, 16, 32].index(default_size), format_func=lambda x: f"{x}-Player Bracket", key="b_size")
     b_surface = sc2.selectbox("Court Surface", ["Hard", "Clay", "Grass"], index=["Hard", "Clay", "Grass"].index(default_surf), key="b_surf")
-    b_best_of = sc3.selectbox("Format", [5, 3] if (b_tour == "ATP" and "Australian Open" in custom_title) else [3, 5], format_func=lambda x: f"Best of {x}", key="b_bo")
+    b_best_of = sc3.selectbox("Match Format", [3, 5], index=[3, 5].index(default_bo), format_func=lambda x: f"Best of {x} Sets", key="b_bo")
 
-    # Place seeds into standard tournament bracket positions (1 vs 16, 8 vs 9, etc.)
+    if len(seeded_players) < b_size:
+        for nm in top_pool:
+            if len(seeded_players) >= b_size:
+                break
+            if nm not in seeded_players:
+                seeded_players.append(nm)
+    seeded_players = seeded_players[:b_size]
+
     seed_slots = _standard_seed_order(b_size)
     bracket_order = [seeded_players[s - 1] for s in seed_slots]
 
-    with st.expander("🛠️ Customize Draw Lineup or Force Round-1 Upsets ('What-If' Simulator)"):
-        st.markdown("**Swap any seeded slot or lock in a Round-1 upset to watch the entire tournament recalculate:**")
+    with st.expander("🛠️ Customize Players or Force Round-1 Upsets ('What-If' Bracket)"):
         forced_r1 = {}
         ov_cols = st.columns(2)
         for m_i in range(b_size // 2):
             p_top = bracket_order[2 * m_i]
             p_bot = bracket_order[2 * m_i + 1]
             choice = ov_cols[m_i % 2].selectbox(
-                f"R1 Match {m_i + 1}: #{seed_slots[2 * m_i]} {p_top} vs #{seed_slots[2 * m_i + 1]} {p_bot}",
-                ["Auto (ML Model)", f"Force {p_top}", f"Force {p_bot}"],
-                key=f"r1_ov_{b_tour}_{b_size}_{m_i}",
+                f"Match {m_i + 1}: #{seed_slots[2 * m_i]} {p_top} vs #{seed_slots[2 * m_i + 1]} {p_bot}",
+                ["Auto (ML Forecast)", f"Force {p_top}", f"Force {p_bot}"],
+                key=f"r1_ov_{b_tour}_{chosen_ev_idx}_{b_size}_{m_i}",
             )
             if choice == f"Force {p_top}":
                 forced_r1[m_i] = p_top
@@ -881,48 +905,49 @@ with tab_bracket:
         pipelines[b_model], feature_cols, forced_r1, n_sims=1000,
     )
 
-    champ_row = odds_df.iloc[0]
-    runner_row = odds_df.iloc[1]
-    k1, k2, k3 = st.columns(3)
-    k1.metric("🏆 Projected Tournament Champion", champ_row["Player"], f"{champ_row['🏆 Win Title %']:.1f}% Title Odds")
-    k2.metric("🥈 Top Contender / Runner-Up", runner_row["Player"], f"{runner_row['🏆 Win Title %']:.1f}% Title Odds")
-    k3.metric("🎯 Model & Surface", b_model.split("[")[0].strip(), f"{b_surface} • Best of {b_best_of}")
+    final_match_row = det_rounds[-1][1].iloc[0]
+    bracket_winner = final_match_row["Projected Winner"].replace("🏆 ", "")
+    final_win_prob = max(final_match_row["P1 Win %"], final_match_row["P2 Win %"])
+    champ_sim_row = odds_df.iloc[0]
 
-    st.markdown("### 📊 Championship & Round-by-Round Survival Probabilities (1,000 Simulations)")
-    col_odds, col_chart = st.columns([1.3, 1])
-    with col_odds:
-        pct_cols = [c for c in odds_df.columns if "%" in c]
-        st.dataframe(
-            odds_df.style.format({c: "{:.1f}%" for c in pct_cols}),
-            use_container_width=True,
-            hide_index=True,
-        )
-    with col_chart:
-        top8_odds = odds_df.head(8)
-        fig_champ = px.bar(
-            top8_odds,
-            x="🏆 Win Title %",
-            y="Player",
-            orientation="h",
-            text="🏆 Win Title %",
-            color="🏆 Win Title %",
-            color_continuous_scale="Blues",
-            title=f"{custom_title} — Title Probability (%)",
-        )
-        fig_champ.update_layout(yaxis={"categoryorder": "total ascending"}, height=360, showlegend=False, coloraxis_showscale=False)
-        st.plotly_chart(fig_champ, use_container_width=True)
+    k1, k2, k3 = st.columns(3)
+    k1.metric("🏆 Predicted Bracket Champion", bracket_winner, f"{final_win_prob:.1f}% Win Chance in Final")
+    k2.metric("📈 Highest Title Odds (1,000 Sims)", champ_sim_row["Player"], f"{champ_sim_row['🏆 Win Title %']:.1f}% Overall Title Odds")
+    k3.metric("🎾 Tournament & Surface", custom_title.split("—")[0].strip(), f"{b_surface} • Best of {b_best_of}")
 
     st.markdown("---")
-    st.markdown("### 🎾 Match-by-Match Forecast Across Every Round")
-    round_tabs = st.tabs([r_title for r_title, _ in det_rounds])
-    for r_tab, (r_title, r_df) in zip(round_tabs, det_rounds):
-        with r_tab:
-            st.dataframe(
-                r_df.style.format({"P1 Win %": "{:.1f}%", "P2 Win %": "{:.1f}%"}),
-                use_container_width=True,
-                hide_index=True,
-            )
+    st.markdown(f"### 🗓️ Complete Tournament Forecast — Every Match & Win % ({custom_title})")
 
+    # Visual side-by-side bracket columns across all rounds
+    r_cols = st.columns(len(det_rounds))
+    all_bracket_matches = []
+    for col_box, (r_title, r_df) in zip(r_cols, det_rounds):
+        with col_box:
+            st.markdown(f"#### {r_title}")
+            for _, mr in r_df.iterrows():
+                w_clean = mr["Projected Winner"].replace("🏆 ", "")
+                p1_bold = f"**🏆 {mr['Player 1']} ({mr['P1 Win %']:.1f}%)**" if w_clean == mr["Player 1"] else f"{mr['Player 1']} ({mr['P1 Win %']:.1f}%)"
+                p2_bold = f"**🏆 {mr['Player 2']} ({mr['P2 Win %']:.1f}%)**" if w_clean == mr["Player 2"] else f"{mr['Player 2']} ({mr['P2 Win %']:.1f}%)"
+                st.info(f"**{mr['Match']}**\n\n{p1_bold}\n\nvs\n\n{p2_bold}")
+                all_bracket_matches.append((f"{r_title} — {mr['Match']}: {mr['Player 1']} vs {mr['Player 2']}", mr["Player 1"], mr["Player 2"]))
+
+    st.markdown("---")
+    st.markdown("### 🔍 Inspect Any Match in This Tournament (Why the Model Picked the Winner)")
+    sel_bm_idx = st.selectbox(
+        "Choose any match from the bracket above to inspect its full stat & probability breakdown",
+        range(len(all_bracket_matches)),
+        format_func=lambda i: all_bracket_matches[i][0],
+        key="bm_inspect",
+    )
+    _, bm_p1_name, bm_p2_name = all_bracket_matches[sel_bm_idx]
+    bm_p1 = get_player_or_default(player_lookup, b_tour, bm_p1_name)
+    bm_p2 = get_player_or_default(player_lookup, b_tour, bm_p2_name)
+    X_bm = build_matchup_row(bm_p1, bm_p2, b_tour, b_surface, int(b_best_of), feature_cols)
+    render_match_drivers(pipelines[b_model], X_bm, bm_p1, bm_p2, bm_p1_name, bm_p2_name, b_surface)
+
+    with st.expander("📊 View Full Round-by-Round Survival & Title Odds Table (1,000 Sims)"):
+        pct_cols = [c for c in odds_df.columns if "%" in c]
+        st.dataframe(odds_df.style.format({c: "{:.1f}%" for c in pct_cols}), use_container_width=True, hide_index=True)
 with tab1:
     st.subheader("Head-to-Head Matchup Simulator")
     c1, c2, c3, c4 = st.columns(4)
@@ -1139,6 +1164,7 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
 
 
 
