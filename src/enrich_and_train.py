@@ -271,23 +271,25 @@ def build_training_dataset(players_df: pd.DataFrame, matches_df: pd.DataFrame, s
         espn_pts = live_pts.get((p["tour"], norm_name(p["player_name"])))
         rolling_pts = sum(x[1] for x in p["pts_events"])
         orig = players_df[players_df["player_id"] == uid].iloc[0]
+        def _num(val, default, cast=float):
+            return default if (val is None or pd.isna(val)) else cast(val)
         updates.append({
             "player_id": uid,
             "tour": p["tour"],
             "player_name": p["player_name"],
-            "hand": p["hand"],
-            "matches_played": int(orig.get("matches_played") or 0),
-            "elo_overall": float(orig.get("elo_overall") or 1500.0),
-            "elo_hard": float(orig.get("elo_hard") or 1500.0),
-            "elo_clay": float(orig.get("elo_clay") or 1500.0),
-            "elo_grass": float(orig.get("elo_grass") or 1500.0),
+            "hand": "R" if (p["hand"] is None or pd.isna(p["hand"])) else str(p["hand"]),
+            "matches_played": _num(orig.get("matches_played"), 0, int),
+            "elo_overall": _num(orig.get("elo_overall"), 1500.0, float),
+            "elo_hard": _num(orig.get("elo_hard"), 1500.0, float),
+            "elo_clay": _num(orig.get("elo_clay"), 1500.0, float),
+            "elo_grass": _num(orig.get("elo_grass"), 1500.0, float),
             "birth_date": p["birth_date"].isoformat() if p["birth_date"] else None,
-            "ranking_points": espn_pts if espn_pts is not None else rolling_pts,
-            "grand_slams": p["slams"],
-            "masters_1000": p["masters"],
-            "total_titles": p["titles"],
+            "ranking_points": int(espn_pts if espn_pts is not None else rolling_pts),
+            "grand_slams": int(p["slams"]),
+            "masters_1000": int(p["masters"]),
+            "total_titles": int(p["titles"]),
             "form_10": round((sum(p["recent_results"]) / len(p["recent_results"])) if p["recent_results"] else 0.5, 3),
-            "matches_14d": len(p["recent_dates"]),
+            "matches_14d": int(len(p["recent_dates"])),
         })
 
     for i in range(0, len(updates), 500):
@@ -371,4 +373,5 @@ if __name__ == "__main__":
     ds = build_training_dataset(players, matches, meta, live_pts)
     print(f"4/4 Retraining 12 ML pipelines on {len(ds):,} matches...")
     train_and_save(ds)
+
 
