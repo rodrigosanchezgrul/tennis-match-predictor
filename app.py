@@ -1,4 +1,5 @@
 ﻿import json
+import math
 import os
 import re
 import urllib.request
@@ -21,11 +22,18 @@ st.set_page_config(
 )
 
 
-# ==============================================================================
-# HELPERS & ESPN LIVE SCHEDULE FETCHER
-# ==============================================================================
 def _norm_name(name: str) -> str:
     return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+
+def _calc_age(birth_date_val) -> float:
+    if not birth_date_val or pd.isna(birth_date_val):
+        return 26.0
+    try:
+        bd = datetime.strptime(str(birth_date_val)[:10], "%Y-%m-%d").date()
+        return round((datetime.now(timezone.utc).date() - bd).days / 365.25, 1)
+    except Exception:
+        return 26.0
 
 
 def _infer_surface(tourney_name: str) -> str:
@@ -72,7 +80,6 @@ def _is_valid_singles_draw(draw_name: str, tour_label: str) -> bool:
 
 @st.cache_data(ttl=300)
 def fetch_upcoming_espn_matches() -> pd.DataFrame:
-    """Fetches upcoming & in-progress ATP and WTA singles matches (next 48h) from ESPN."""
     now_utc = datetime.now(timezone.utc)
     end_utc = now_utc + timedelta(days=2)
     date_range = f"{now_utc.strftime('%Y%m%d')}-{end_utc.strftime('%Y%m%d')}"
@@ -110,8 +117,7 @@ def fetch_upcoming_espn_matches() -> pd.DataFrame:
                 status_type = comp.get("status", {}).get("type", {})
                 if status_type.get("completed", False):
                     continue
-
-                competitors = comp.get("competitors", [])
+                competitors = comp.get("competitions") or comp.get("competitors", [])
                 if len(competitors) != 2:
                     continue
 
@@ -152,13 +158,9 @@ def fetch_upcoming_espn_matches() -> pd.DataFrame:
 
     if not rows:
         return pd.DataFrame()
-
     return pd.DataFrame(rows).sort_values(["IsLive", "sort_ts"], ascending=[False, True]).reset_index(drop=True)
 
 
-# ==============================================================================
-# CACHED DATA & MODEL LOADERS
-# ==============================================================================
 @st.cache_resource
 def get_supabase() -> Client:
     url = os.environ.get("SUPABASE_URL") or st.secrets.get("SUPABASE_URL")
@@ -181,12 +183,19 @@ def load_players() -> pd.DataFrame:
             break
         start += step
     df = pd.DataFrame(all_rows)
+    for col, default in [
+        ("ranking_points", 0), ("grand_slams", 0), ("masters_1000", 0),
+        ("total_titles", 0), ("form_10", 0.5), ("matches_14d", 0),
+    ]:
+        if col not in df.columns:
+            df[col] = default
+        df[col] = df[col].fillna(default)
+    df["age"] = df["birth_date"].apply(_calc_age) if "birth_date" in df.columns else 26.0
     return df.sort_values("elo_overall", ascending=False).reset_index(drop=True)
 
 
 @st.cache_data(ttl=600)
 def load_player_matches(player_uid: str) -> pd.DataFrame:
-    """Fetches all career matches (2015-present) for one player from Supabase."""
     if not player_uid:
         return pd.DataFrame()
     sb = get_supabase()
@@ -245,12 +254,8 @@ def load_feature_cols() -> list:
 def label_to_filename(full_label: str) -> str:
     safe = (
         full_label.lower()
-        .replace(" ", "_")
-        .replace("(", "")
-        .replace(")", "")
-        .replace("[", "")
-        .replace("]", "")
-        .replace("%", "")
+        .replace(" ", "_").replace("(", "").replace(")", "")
+        .replace("[", "").replace("]", "").replace("%", "")
     )
     return f"models/saved/{safe}.joblib"
 
@@ -277,6 +282,20 @@ def build_matchup_row(p1, p2, tour: str, surface: str, best_of: int, feature_col
     p2_elo = float(p2["elo_overall"])
     p1_surf = float(p1[surf_col])
     p2_surf = float(p2[surf_col])
+    p1_age = float(p1.get("age", 26.0))
+    p2_age = float(p2.get("age", 26.0))
+    p1_pts = float(p1.get("ranking_points", 0))
+    p2_pts = float(p2.get("ranking_points", 0))
+    p1_slams = float(p1.get("grand_slams", 0))
+    p2_slams = float(p2.get("grand_slams", 0))
+    p1_mast = float(p1.get("masters_1000", 0))
+    p2_mast = float(p2.get("masters_1000", 0))
+    p1_tit = float(p1.get("total_titles", 0))
+    p2_tit = float(p2.get("total_titles", 0))
+    p1_f10 = float(p1.get("form_10", 0.5))
+    p2_f10 = float(p2.get("form_10", 0.5))
+    p1_m14 = float(p1.get("matches_14d", 0))
+    p2_m14 = float(p2.get("matches_14d", 0))
 
     elo_prob = 1.0 / (1.0 + 10.0 ** ((p2_elo - p1_elo) / 400.0))
     surf_prob = 1.0 / (1.0 + 10.0 ** ((p2_surf - p1_surf) / 400.0))
@@ -290,6 +309,18 @@ def build_matchup_row(p1, p2, tour: str, surface: str, best_of: int, feature_col
         "p2_elo": p2_elo,
         "p1_surf_elo": p1_surf,
         "p2_surf_elo": p2_surf,
+        "age_diff": p1_age - p2_age,
+        "p1_age": p1_age,
+        "p2_age": p2_age,
+        "p1_peak_dist": abs(p1_age - 26.0),
+        "p2_peak_dist": abs(p2_age - 26.0),
+        "pts_diff": p1_pts - p2_pts,
+        "log_pts_ratio": math.log((p1_pts + 100.0) / (p2_pts + 100.0)),
+        "slam_diff": p1_slams - p2_slams,
+        "masters_diff": p1_mast - p2_mast,
+        "titles_diff": p1_tit - p2_tit,
+        "form10_diff": p1_f10 - p2_f10,
+        "fatigue14_diff": p1_m14 - p2_m14,
         "is_atp": 1 if tour == "ATP" else 0,
         "best_of": best_of,
         "surf_hard": 1 if surface == "Hard" else 0,
@@ -323,15 +354,19 @@ def get_player_or_default(lookup: dict, tour: str, name: str) -> dict:
             "elo_hard": 1500.0,
             "elo_clay": 1500.0,
             "elo_grass": 1500.0,
+            "age": 26.0,
+            "ranking_points": 0,
+            "grand_slams": 0,
+            "masters_1000": 0,
+            "total_titles": 0,
+            "form_10": 0.5,
+            "matches_14d": 0,
         },
     )
 
 
-# ==============================================================================
-# MAIN UI
-# ==============================================================================
 st.title("🎾 ATP & WTA Machine Learning Match Predictor Lab")
-st.caption("Chronological Surface-Elo Engine • Multi-Model Benchmark (Raw vs. PCA) • Live Supabase & ESPN Sync")
+st.caption("Chronological Surface-Elo + Age + Ranking Points + Career Trophies Engine • Live Supabase & ESPN Sync")
 
 players_df = load_players()
 player_lookup = build_player_lookup(players_df)
@@ -344,23 +379,18 @@ tab_today, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "🔮 Custom Matchup Simulator",
     "🏆 Model Leaderboard & Overfitting Lab",
     "📈 Diagnostic Graphs & Learning Curves",
-    "📊 ATP / WTA Elo Rankings",
+    "📊 ATP / WTA Elo & Trophy Rankings",
     "📋 Player Match History",
 ])
 
-# ------------------------------------------------------------------------------
-# TAB 0: TODAY'S & UPCOMING SCHEDULED MATCHES FORECASTS
-# ------------------------------------------------------------------------------
 with tab_today:
     st.subheader("Live & Upcoming ATP / WTA Match Forecasts (Next 48 Hours)")
-
     fc1, fc2, fc3 = st.columns([1, 2, 1])
     slate_tour = fc1.selectbox("Tour Filter", ["ALL", "ATP", "WTA"], key="slate_tour")
     slate_model = fc2.selectbox("Primary Forecast Model", leaderboard_df["full_label"].tolist(), index=0, key="slate_model")
     min_conf = fc3.slider("Min Win Probability (%)", 50, 90, 50, key="slate_conf")
 
     upcoming_df = fetch_upcoming_espn_matches()
-
     if upcoming_df.empty:
         st.info(
             "No scheduled ATP or WTA singles matches were found on ESPN for the next 48 hours "
@@ -372,34 +402,26 @@ with tab_today:
 
         forecast_rows = []
         detailed_matches = []
-
         for _, m in upcoming_df.iterrows():
             p1 = get_player_or_default(player_lookup, m["Tour"], m["Player1"])
             p2 = get_player_or_default(player_lookup, m["Tour"], m["Player2"])
             X_m = build_matchup_row(p1, p2, m["Tour"], m["Surface"], int(m["BestOf"]), feature_cols)
-
             prob1_primary = predict_prob_single(pipelines[slate_model], X_m)
             prob2_primary = 1.0 - prob1_primary
-
             all_p1_probs = [predict_prob_single(pipelines[lbl], X_m) for lbl in leaderboard_df["full_label"]]
             p1_votes = sum(1 for pr in all_p1_probs if pr >= 0.5)
             total_models = len(all_p1_probs)
 
             if prob1_primary >= 0.5:
-                fav_name = m["Player1"]
-                fav_prob = prob1_primary * 100
-                consensus = f"{p1_votes}/{total_models} models"
+                fav_name, fav_prob, consensus = m["Player1"], prob1_primary * 100, f"{p1_votes}/{total_models} models"
             else:
-                fav_name = m["Player2"]
-                fav_prob = prob2_primary * 100
-                consensus = f"{total_models - p1_votes}/{total_models} models"
+                fav_name, fav_prob, consensus = m["Player2"], prob2_primary * 100, f"{total_models - p1_votes}/{total_models} models"
 
             if fav_prob < min_conf:
                 continue
 
             surf_key = f"elo_{m['Surface'].lower()}"
             match_label = f"[{m['Tour']}] {m['Player1']} vs {m['Player2']} — {m['Tournament']}"
-
             forecast_rows.append({
                 "Time / Status": m["Status"],
                 "Tour": m["Tour"],
@@ -409,13 +431,13 @@ with tab_today:
                 "Predicted Winner": f"🏆 {fav_name}",
                 "Win Prob %": round(fav_prob, 1),
                 "Model Consensus": consensus,
-                f"P1 Elo ({m['Surface']})": f"{p1['elo_overall']:.0f} ({p1[surf_key]:.0f})",
-                f"P2 Elo ({m['Surface']})": f"{p2['elo_overall']:.0f} ({p2[surf_key]:.0f})",
+                "P1 Elo / Pts": f"{p1['elo_overall']:.0f} / {int(p1['ranking_points']):,}",
+                "P2 Elo / Pts": f"{p2['elo_overall']:.0f} / {int(p2['ranking_points']):,}",
             })
             detailed_matches.append((match_label, m, p1, p2, X_m, prob1_primary))
 
         if not forecast_rows:
-            st.warning("No scheduled matches match your current filter settings. Lower the minimum win probability slider or select ALL tours.")
+            st.warning("No scheduled matches match your current filter settings.")
         else:
             f_df = pd.DataFrame(forecast_rows)
             k1, k2, k3, k4 = st.columns(4)
@@ -423,62 +445,32 @@ with tab_today:
             k2.metric("ATP Matches", int((f_df["Tour"] == "ATP").sum()))
             k3.metric("WTA Matches", int((f_df["Tour"] == "WTA").sum()))
             k4.metric("Strong Favorites (≥65%)", int((f_df["Win Prob %"] >= 65.0).sum()))
+            st.dataframe(f_df.style.format({"Win Prob %": "{:.1f}%"}), use_container_width=True, hide_index=True)
 
-            st.dataframe(
-                f_df.style.format({"Win Prob %": "{:.1f}%"}),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            # Deep-Dive Inspector for Any Scheduled Match
             st.markdown("---")
             st.subheader("Inspect Any Scheduled Match in Detail")
-            selected_idx = st.selectbox(
-                "Choose a match from today's slate",
-                range(len(detailed_matches)),
-                format_func=lambda i: detailed_matches[i][0],
-            )
+            selected_idx = st.selectbox("Choose a match from today's slate", range(len(detailed_matches)), format_func=lambda i: detailed_matches[i][0])
             _, sel_m, sel_p1, sel_p2, sel_X, sel_prob1 = detailed_matches[selected_idx]
+            s_col = f"elo_{sel_m['Surface'].lower()}"
 
             dm1, dm2, dm3 = st.columns([2, 1, 2])
             with dm1:
                 st.metric(
-                    label=f"{sel_m['Player1']} (Elo: {sel_p1['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p1[f"elo_{sel_m['Surface'].lower()}"]:.0f})",
+                    label=f"{sel_m['Player1']} (Age {sel_p1['age']:.1f} • {int(sel_p1['ranking_points']):,} pts • {int(sel_p1['grand_slams'])} GS / {int(sel_p1['masters_1000'])} M1000)",
                     value=f"{sel_prob1:.1%} Win Chance",
+                    delta=f"Elo {sel_p1['elo_overall']:.0f} ({sel_m['Surface']}: {sel_p1[s_col]:.0f})",
                 )
             with dm2:
-                st.markdown(
-                    f"<div style='text-align:center; padding-top:10px;'><b>{sel_m['Surface']}</b><br>{sel_m['Status']}</div>",
-                    unsafe_allow_html=True,
-                )
+                st.markdown(f"<div style='text-align:center; padding-top:10px;'><b>{sel_m['Surface']}</b><br>{sel_m['Status']}</div>", unsafe_allow_html=True)
             with dm3:
                 st.metric(
-                    label=f"{sel_m['Player2']} (Elo: {sel_p2['elo_overall']:.0f} | {sel_m['Surface']}: {sel_p2[f"elo_{sel_m['Surface'].lower()}"]:.0f})",
+                    label=f"{sel_m['Player2']} (Age {sel_p2['age']:.1f} • {int(sel_p2['ranking_points']):,} pts • {int(sel_p2['grand_slams'])} GS / {int(sel_p2['masters_1000'])} M1000)",
                     value=f"{(1.0 - sel_prob1):.1%} Win Chance",
+                    delta=f"Elo {sel_p2['elo_overall']:.0f} ({sel_m['Surface']}: {sel_p2[s_col]:.0f})",
                 )
 
-            p1_recent = load_player_matches(sel_p1.get("player_id", ""))
-            p2_recent = load_player_matches(sel_p2.get("player_id", ""))
-            rc1, rc2 = st.columns(2)
-            with rc1:
-                st.markdown(f"**{sel_m['Player1']} — Last 5 Matches**")
-                if p1_recent.empty:
-                    st.caption("No historical matches on file yet.")
-                else:
-                    st.dataframe(p1_recent.head(5)[["Date", "Result", "Opponent", "Score", "Surface"]], use_container_width=True, hide_index=True)
-            with rc2:
-                st.markdown(f"**{sel_m['Player2']} — Last 5 Matches**")
-                if p2_recent.empty:
-                    st.caption("No historical matches on file yet.")
-                else:
-                    st.dataframe(p2_recent.head(5)[["Date", "Result", "Opponent", "Score", "Surface"]], use_container_width=True, hide_index=True)
-
-# ------------------------------------------------------------------------------
-# TAB 1: CUSTOM MATCHUP SIMULATOR (ALL MODELS SIDE-BY-SIDE + RECENT FORM)
-# ------------------------------------------------------------------------------
 with tab1:
     st.subheader("Head-to-Head Matchup Simulator")
-
     c1, c2, c3, c4 = st.columns(4)
     tour = c1.selectbox("Tour", ["ATP", "WTA"])
     surface = c2.selectbox("Court Surface", ["Hard", "Clay", "Grass"])
@@ -498,23 +490,25 @@ with tab1:
         p1_row = tour_players[tour_players["player_name"] == p1_name].iloc[0]
         p2_row = tour_players[tour_players["player_name"] == p2_name].iloc[0]
         X_match = build_matchup_row(p1_row, p2_row, tour, surface, best_of, feature_cols)
-
         p1_prob = predict_prob_single(pipelines[primary_model], X_match)
         p2_prob = 1.0 - p1_prob
+        s_col = f"elo_{surface.lower()}"
 
         st.markdown("---")
         m1, m2, m3 = st.columns([2, 1, 2])
         with m1:
             st.metric(
-                label=f"{p1_name} (Overall Elo: {p1_row['elo_overall']:.0f} | {surface}: {p1_row[f'elo_{surface.lower()}']:.0f})",
+                label=f"{p1_name} (Age {p1_row['age']:.1f} • {int(p1_row['ranking_points']):,} pts)",
                 value=f"{p1_prob:.1%} Win Chance",
+                delta=f"Elo {p1_row['elo_overall']:.0f} • {int(p1_row['grand_slams'])} GS / {int(p1_row['masters_1000'])} M1000",
             )
         with m2:
             st.markdown("<h3 style='text-align: center; padding-top: 15px;'>VS</h3>", unsafe_allow_html=True)
         with m3:
             st.metric(
-                label=f"{p2_name} (Overall Elo: {p2_row['elo_overall']:.0f} | {surface}: {p2_row[f'elo_{surface.lower()}']:.0f})",
+                label=f"{p2_name} (Age {p2_row['age']:.1f} • {int(p2_row['ranking_points']):,} pts)",
                 value=f"{p2_prob:.1%} Win Chance",
+                delta=f"Elo {p2_row['elo_overall']:.0f} • {int(p2_row['grand_slams'])} GS / {int(p2_row['masters_1000'])} M1000",
             )
 
         p1_hist = load_player_matches(p1_row["player_id"])
@@ -524,35 +518,22 @@ with tab1:
             h2h = p1_hist[p1_hist["Opponent_UID"] == p2_row["player_id"]]
             p1_h2h_wins = int(h2h["Won"].sum()) if not h2h.empty else 0
             p2_h2h_wins = len(h2h) - p1_h2h_wins
-
             st.subheader(f"Recent Form & Head-to-Head ({p1_name} {p1_h2h_wins} – {p2_h2h_wins} {p2_name})")
             if not h2h.empty:
                 with st.expander(f"View All {len(h2h)} Head-to-Head Meetings (2015–Present)"):
-                    st.dataframe(
-                        h2h[["Date", "Result", "Score", "Tournament", "Surface", "Round"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                    st.dataframe(h2h[["Date", "Result", "Score", "Tournament", "Surface", "Round"]], use_container_width=True, hide_index=True)
 
             rc1, rc2 = st.columns(2)
             with rc1:
                 last10_p1 = p1_hist.head(10)
                 w10_1 = int(last10_p1["Won"].sum())
                 st.markdown(f"**{p1_name} — Latest 10 Matches ({w10_1}W – {len(last10_p1) - w10_1}L)**")
-                st.dataframe(
-                    last10_p1[["Date", "Result", "Opponent", "Score", "Surface", "Tournament"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.dataframe(last10_p1[["Date", "Result", "Opponent", "Score", "Surface", "Tournament"]], use_container_width=True, hide_index=True)
             with rc2:
                 last10_p2 = p2_hist.head(10)
                 w10_2 = int(last10_p2["Won"].sum())
                 st.markdown(f"**{p2_name} — Latest 10 Matches ({w10_2}W – {len(last10_p2) - w10_2}L)**")
-                st.dataframe(
-                    last10_p2[["Date", "Result", "Opponent", "Score", "Surface", "Tournament"]],
-                    use_container_width=True,
-                    hide_index=True,
-                )
+                st.dataframe(last10_p2[["Date", "Result", "Opponent", "Score", "Surface", "Tournament"]], use_container_width=True, hide_index=True)
 
         st.subheader("How All 12 Trained Models Vote on This Match")
         model_votes = []
@@ -569,13 +550,8 @@ with tab1:
         votes_df = pd.DataFrame(model_votes)
 
         fig_votes = px.bar(
-            votes_df,
-            x=f"{p1_name} Win %",
-            y="Model",
-            color="Feature Mode",
-            orientation="h",
-            range_x=[0, 100],
-            text=f"{p1_name} Win %",
+            votes_df, x=f"{p1_name} Win %", y="Model", color="Feature Mode",
+            orientation="h", range_x=[0, 100], text=f"{p1_name} Win %",
             title=f"Predicted Win Probability for {p1_name} Across Every Model",
         )
         fig_votes.add_vline(x=50, line_dash="dash", line_color="gray")
@@ -585,74 +561,35 @@ with tab1:
         with st.expander("Inspect Exact Matchup Feature Vector Fed into Models"):
             st.dataframe(X_match, use_container_width=True)
 
-# ------------------------------------------------------------------------------
-# TAB 2: MODEL LEADERBOARD & OVERFITTING LAB
-# ------------------------------------------------------------------------------
 with tab2:
     st.subheader("Train (2016–2024) vs. Out-of-Sample Test (2025–2026) Benchmark")
-
-    mode_filter = st.multiselect(
-        "Filter by Feature Pipeline",
-        options=leaderboard_df["feature_mode"].unique().tolist(),
-        default=leaderboard_df["feature_mode"].unique().tolist(),
-    )
+    mode_filter = st.multiselect("Filter by Feature Pipeline", options=leaderboard_df["feature_mode"].unique().tolist(), default=leaderboard_df["feature_mode"].unique().tolist())
     filtered_lb = leaderboard_df[leaderboard_df["feature_mode"].isin(mode_filter)].copy()
 
     fig_gap = go.Figure()
-    fig_gap.add_trace(go.Bar(
-        name="Train Accuracy (2016-2024)",
-        x=filtered_lb["full_label"],
-        y=filtered_lb["train_acc"] * 100,
-        marker_color="#4C72B0",
-    ))
-    fig_gap.add_trace(go.Bar(
-        name="Out-of-Sample Test Accuracy (2025-2026)",
-        x=filtered_lb["full_label"],
-        y=filtered_lb["test_acc"] * 100,
-        marker_color="#55A868",
-    ))
-    fig_gap.update_layout(
-        barmode="group",
-        title="Train vs. Test Accuracy (Spot Overfitting When Blue Bar Towers Over Green Bar)",
-        yaxis_title="Accuracy (%)",
-        yaxis_range=[58, 72],
-        height=430,
-    )
+    fig_gap.add_trace(go.Bar(name="Train Accuracy (2016-2024)", x=filtered_lb["full_label"], y=filtered_lb["train_acc"] * 100, marker_color="#4C72B0"))
+    fig_gap.add_trace(go.Bar(name="Out-of-Sample Test Accuracy (2025-2026)", x=filtered_lb["full_label"], y=filtered_lb["test_acc"] * 100, marker_color="#55A868"))
+    fig_gap.update_layout(barmode="group", title="Train vs. Test Accuracy", yaxis_title="Accuracy (%)", yaxis_range=[58, 75], height=430)
     st.plotly_chart(fig_gap, use_container_width=True)
 
     st.dataframe(
         filtered_lb.style.format({
-            "train_acc": "{:.2%}",
-            "test_acc": "{:.2%}",
-            "overfit_gap": "{:+.2%}",
-            "train_auc": "{:.4f}",
-            "test_auc": "{:.4f}",
-            "train_brier": "{:.4f}",
-            "test_brier": "{:.4f}",
-            "train_seconds": "{:.2f}s",
+            "train_acc": "{:.2%}", "test_acc": "{:.2%}", "overfit_gap": "{:+.2%}",
+            "train_auc": "{:.4f}", "test_auc": "{:.4f}", "train_brier": "{:.4f}",
+            "test_brier": "{:.4f}", "train_seconds": "{:.2f}s",
         }),
         use_container_width=True,
     )
 
-# ------------------------------------------------------------------------------
-# TAB 3: DIAGNOSTIC GRAPHS & LEARNING CURVES
-# ------------------------------------------------------------------------------
 with tab3:
     st.subheader("Model Diagnostics: Learning Curves, ROC Curves & PCA Variance")
-
     plot_specs = [
-        ("models/plots/5_learning_curve.png", "1. Training vs. Validation Learning Curve",
-         "Shows how model accuracy scales as we feed more historical matches (from 15% up to 100% of the training set). Converging curves indicate healthy generalization."),
-        ("models/plots/3_roc_curves.png", "2. Out-of-Sample ROC Curves (2025–2026)",
-         "Compares True Positive Rate vs. False Positive Rate across all probability thresholds. Higher Area Under the Curve (AUC) means better ranking separation."),
-        ("models/plots/2_pca_vs_raw_auc.png", "3. Raw Features vs. PCA (95% Variance) Impact",
-         "Compares each algorithm before and after Principal Component Analysis. Linear models benefit from decorrelated components, while tree models prefer raw splits."),
-        ("models/plots/4_pca_variance.png", "4. PCA Scree & Cumulative Explained Variance Plot",
-         "Shows how much information each principal component captures and how many components are needed to hit the 95% variance threshold."),
-        ("models/plots/1_train_vs_test_overfit.png", "5. Train vs. Test Overfitting Gap",
-         "Highlights models that memorized historical noise (like Random Forest) versus models that stayed balanced on unseen 2025–2026 matches."),
+        ("models/plots/5_learning_curve.png", "1. Training vs. Validation Learning Curve", "Shows how model accuracy scales as more historical matches are added."),
+        ("models/plots/3_roc_curves.png", "2. Out-of-Sample ROC Curves", "Compares True Positive Rate vs. False Positive Rate across thresholds."),
+        ("models/plots/2_pca_vs_raw_auc.png", "3. Raw Features vs. PCA (95% Variance) Impact", "Compares each algorithm before and after PCA."),
+        ("models/plots/4_pca_variance.png", "4. PCA Scree & Cumulative Explained Variance Plot", "Shows explained variance per principal component."),
+        ("models/plots/1_train_vs_test_overfit.png", "5. Train vs. Test Overfitting Gap", "Highlights generalization vs. overfitting."),
     ]
-
     for img_path, title, desc in plot_specs:
         if os.path.exists(img_path):
             st.markdown(f"### {title}")
@@ -660,11 +597,8 @@ with tab3:
             st.image(img_path, use_container_width=True)
             st.markdown("---")
 
-# ------------------------------------------------------------------------------
-# TAB 4: ATP / WTA ELO RANKINGS EXPLORER
-# ------------------------------------------------------------------------------
 with tab4:
-    st.subheader("Live Supabase Player Elo Ratings (2015–2026)")
+    st.subheader("Live Supabase Player Elo, Age, Points & Trophy Rankings")
     f1, f2, f3 = st.columns([1, 1, 2])
     tour_pick = f1.selectbox("Filter Tour", ["ALL", "ATP", "WTA"])
     min_matches = f2.slider("Minimum Matches Played", 0, 200, 30)
@@ -679,16 +613,12 @@ with tab4:
     view_df = view_df.reset_index(drop=True)
     view_df.index += 1
     st.dataframe(
-        view_df[["player_name", "tour", "hand", "matches_played", "elo_overall", "elo_hard", "elo_clay", "elo_grass"]],
+        view_df[["player_name", "tour", "age", "ranking_points", "grand_slams", "masters_1000", "total_titles", "elo_overall", "elo_hard", "elo_clay", "elo_grass"]],
         use_container_width=True,
     )
 
-# ------------------------------------------------------------------------------
-# TAB 5: PLAYER MATCH HISTORY & ELO EVOLUTION
-# ------------------------------------------------------------------------------
 with tab5:
     st.subheader("Player Match History & Elo Progression (2015–Present)")
-
     hc1, hc2, hc3, hc4 = st.columns([1, 2, 1, 1])
     hist_tour = hc1.selectbox("Tour", ["ATP", "WTA"], key="hist_tour")
     hist_tour_players = players_df[players_df["tour"] == hist_tour].reset_index(drop=True)
@@ -705,27 +635,15 @@ with tab5:
         total_w = int(match_log["Won"].sum())
         total_l = len(match_log) - total_w
         win_pct = (total_w / len(match_log)) * 100 if len(match_log) else 0.0
-        last10 = match_log.head(10)
-        l10_w = int(last10["Won"].sum())
-
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("Career Record (2015–Now)", f"{total_w}W – {total_l}L", f"{win_pct:.1f}% Win Rate")
-        k2.metric("Latest 10 Matches", f"{l10_w}W – {len(last10) - l10_w}L")
-        k3.metric("Current Overall Elo", f"{sel_player['elo_overall']:.0f}")
-        k4.metric(
-            "Surface Elo (H / C / G)",
-            f"{sel_player['elo_hard']:.0f} / {sel_player['elo_clay']:.0f} / {sel_player['elo_grass']:.0f}",
-        )
+        k2.metric("Age & Official Points", f"{sel_player['age']:.1f} yrs", f"{int(sel_player['ranking_points']):,} pts")
+        k3.metric("Grand Slams / Masters 1000", f"{int(sel_player['grand_slams'])} GS / {int(sel_player['masters_1000'])} M1000", f"{int(sel_player['total_titles'])} Total Titles")
+        k4.metric("Current Overall Elo", f"{sel_player['elo_overall']:.0f}", f"H:{sel_player['elo_hard']:.0f} C:{sel_player['elo_clay']:.0f} G:{sel_player['elo_grass']:.0f}")
 
         elo_series = match_log.dropna(subset=["Player Elo"]).iloc[::-1].copy()
         if len(elo_series) > 1:
-            fig_elo = px.line(
-                elo_series,
-                x="Date",
-                y="Player Elo",
-                hover_data=["Result", "Opponent", "Score", "Tournament", "Surface"],
-                title=f"{hist_player_name} — Pre-Match Elo Rating Over Time",
-            )
+            fig_elo = px.line(elo_series, x="Date", y="Player Elo", hover_data=["Result", "Opponent", "Score", "Tournament", "Surface"], title=f"{hist_player_name} — Pre-Match Elo Rating Over Time")
             fig_elo.update_traces(line_color="#1f77b4", line_width=2)
             fig_elo.update_layout(height=320, margin=dict(l=20, r=20, t=45, b=20))
             st.plotly_chart(fig_elo, use_container_width=True)
@@ -743,10 +661,7 @@ with tab5:
             filtered_log = filtered_log[~filtered_log["Won"]]
         if opp_search.strip():
             q = opp_search.strip()
-            filtered_log = filtered_log[
-                filtered_log["Opponent"].str.contains(q, case=False, na=False)
-                | filtered_log["Tournament"].str.contains(q, case=False, na=False)
-            ]
+            filtered_log = filtered_log[filtered_log["Opponent"].str.contains(q, case=False, na=False) | filtered_log["Tournament"].str.contains(q, case=False, na=False)]
 
         if hist_limit == "Latest 15":
             filtered_log = filtered_log.head(15)
@@ -754,9 +669,4 @@ with tab5:
             filtered_log = filtered_log.head(50)
 
         st.caption(f"Showing {len(filtered_log)} matches")
-        st.dataframe(
-            filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
+        st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
