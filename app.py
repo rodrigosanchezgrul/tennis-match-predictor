@@ -740,8 +740,8 @@ with tab2:
     def _classify_fit(row):
         if row["overfit_gap"] > 0.045:
             return "⚠️ Slight Overfit"
-        if row["test_acc"] < 0.655:
-            return "📉 Compressed (PCA Loss)"
+        if "PCA" in str(row["feature_mode"]):
+            return "✅ Good Fit (PCA)"
         return "✅ Good Fit"
 
     lb_with_fit = leaderboard_df.copy()
@@ -857,6 +857,7 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
 
 
 
