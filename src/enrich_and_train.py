@@ -139,8 +139,11 @@ def build_training_dataset(players_df: pd.DataFrame, matches_df: pd.DataFrame, s
         tour = r["tour"]
         key = (tour, norm_name(r["player_name"]))
         s = seed_meta.get(key, {})
-        bdate_str = r.get("birth_date") or s.get("birth_date")
-        bdate = datetime.strptime(str(bdate_str)[:10], "%Y-%m-%d").date() if bdate_str else None
+        raw_bd = r.get("birth_date")
+        bdate_str = None if (raw_bd is None or pd.isna(raw_bd)) else str(raw_bd)
+        if not bdate_str:
+            bdate_str = s.get("birth_date")
+        bdate = datetime.strptime(str(bdate_str)[:10], "%Y-%m-%d").date() if (bdate_str and str(bdate_str).lower() != "nan") else None
         p_info[uid] = {
             "player_id": uid,
             "tour": tour,
@@ -373,5 +376,6 @@ if __name__ == "__main__":
     ds = build_training_dataset(players, matches, meta, live_pts)
     print(f"4/4 Retraining 12 ML pipelines on {len(ds):,} matches...")
     train_and_save(ds)
+
 
 
