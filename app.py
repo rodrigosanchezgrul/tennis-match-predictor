@@ -737,8 +737,20 @@ with tab1:
 
 with tab2:
     st.subheader("Train (2016–2024) vs. Out-of-Sample Test (2025–2026) Benchmark")
-    mode_filter = st.multiselect("Filter by Feature Pipeline", options=leaderboard_df["feature_mode"].unique().tolist(), default=leaderboard_df["feature_mode"].unique().tolist())
-    filtered_lb = leaderboard_df[leaderboard_df["feature_mode"].isin(mode_filter)].copy()
+    def _classify_fit(row):
+        if row["overfit_gap"] > 0.05:
+            return "⚠️ Overfitted"
+        if row["test_acc"] < 0.65:
+            return "📉 Underfitted"
+        return "✅ Good Fit"
+
+    lb_with_fit = leaderboard_df.copy()
+    lb_with_fit.insert(3, "Fit Status", lb_with_fit.apply(_classify_fit, axis=1))
+
+    fc_m, fc_s = st.columns(2)
+    mode_filter = fc_m.multiselect("Filter by Feature Pipeline", options=lb_with_fit["feature_mode"].unique().tolist(), default=lb_with_fit["feature_mode"].unique().tolist())
+    fit_filter = fc_s.multiselect("Filter by Fit Status", options=lb_with_fit["Fit Status"].unique().tolist(), default=lb_with_fit["Fit Status"].unique().tolist())
+    filtered_lb = lb_with_fit[lb_with_fit["feature_mode"].isin(mode_filter) & lb_with_fit["Fit Status"].isin(fit_filter)].copy()
 
     fig_gap = go.Figure()
     fig_gap.add_trace(go.Bar(name="Train Accuracy (2016-2024)", x=filtered_lb["full_label"], y=filtered_lb["train_acc"] * 100, marker_color="#4C72B0"))
@@ -753,6 +765,7 @@ with tab2:
             "test_brier": "{:.4f}", "train_seconds": "{:.2f}s",
         }),
         use_container_width=True,
+        hide_index=True,
     )
 
 with tab3:
@@ -844,4 +857,5 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
 
