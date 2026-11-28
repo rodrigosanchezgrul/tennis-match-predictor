@@ -38,7 +38,7 @@ def refresh_daily_player_stats():
     players = []
     start = 0
     while True:
-        res = sb.table("players").select("player_id,tour,player_name,grand_slams,masters_1000,total_titles").range(start, start + 999).execute()
+        res = sb.table("players").select("player_id,tour,player_name,hand,matches_played,elo_overall,elo_hard,elo_clay,elo_grass,grand_slams,masters_1000,total_titles").range(start, start + 999).execute()
         if not res.data:
             break
         players.extend(res.data)
@@ -78,7 +78,7 @@ def refresh_daily_player_stats():
     updates = []
     for p in players:
         uid = p["player_id"]
-        patch = {"player_id": uid}
+        patch = {"player_id": uid, "tour": p["tour"], "player_name": p["player_name"], "hand": p.get("hand") or "R", "matches_played": int(p.get("matches_played") or 0), "elo_overall": float(p.get("elo_overall") or 1500.0), "elo_hard": float(p.get("elo_hard") or 1500.0), "elo_clay": float(p.get("elo_clay") or 1500.0), "elo_grass": float(p.get("elo_grass") or 1500.0)}
         new_pts = pts_map.get((p["tour"], norm_name(p["player_name"])))
         if new_pts is not None:
             patch["ranking_points"] = new_pts
@@ -99,3 +99,4 @@ def refresh_daily_player_stats():
 
 if __name__ == "__main__":
     refresh_daily_player_stats()
+
