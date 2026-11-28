@@ -549,6 +549,163 @@ def get_player_or_default(lookup: dict, tour: str, name: str) -> dict:
     )
 
 
+def _standard_seed_order(n: int) -> list:
+    order = [1, 2]
+    while len(order) < n:
+        nxt = []
+        target_sum = len(order) * 2 + 1
+        for s in order:
+            nxt.extend([s, target_sum - s])
+        order = nxt
+    return order
+
+
+@st.cache_data(ttl=300)
+def fetch_espn_tournament_draw(tour_label: str):
+    """Fetches active tournament name, surface, and current matches from ESPN if available."""
+    slug = "atp" if tour_label == "ATP" else "wta"
+    now_utc = datetime.now(timezone.utc)
+    end_utc = now_utc + timedelta(days=7)
+    date_range = f"{now_utc.strftime('%Y%m%d')}-{end_utc.strftime('%Y%m%d')}"
+    url = f"https://site.api.espn.com/apis/site/v2/sports/tennis/{slug}/scoreboard?dates={date_range}&limit=200"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+    for event in payload.get("events", []):
+        t_name = event.get("name", "")
+        comps = []
+        groups = event.get("groupings", [])
+        if groups:
+            for grp in groups:
+                if _is_valid_singles_draw(grp.get("grouping", {}).get("displayName", ""), tour_label):
+                    comps.extend(grp.get("competitions", []))
+        else:
+            comps.extend(event.get("competitions", []))
+
+        pairs = []
+        for comp in comps:
+            if comp.get("status", {}).get("type", {}).get("completed", False):
+                continue
+            competitors = comp.get("competitions") or comp.get("competitors", [])
+            if len(competitors) != 2:
+                continue
+            p1 = (competitors[0].get("athlete") or competitors[0].get("team") or {}).get("displayName", "")
+            p2 = (competitors[1].get("athlete") or competitors[1].get("team") or {}).get("displayName", "")
+            if p1 and p2 and "TBD" not in (p1, p2):
+                pairs.append((p1, p2))
+        if pairs:
+            return {"name": t_name, "surface": _infer_surface(t_name), "pairs": pairs}
+    return None
+
+
+def simulate_tournament_bracket(
+    bracket_players: list,
+    player_lookup: dict,
+    tour: str,
+    surface: str,
+    best_of: int,
+    pipeline,
+    feature_cols: list,
+    forced_r1: dict,
+    n_sims: int = 1000,
+):
+    """Runs deterministic path + n_sims Monte Carlo bracket simulations using the selected ML pipeline."""
+    n = len(bracket_players)
+    prob_cache = {}
+
+    def get_pair_prob(name_a: str, name_b: str) -> float:
+        if name_a == name_b:
+            return 0.5
+        key = (name_a, name_b)
+        if key in prob_cache:
+            return prob_cache[key]
+        pa = get_player_or_default(player_lookup, tour, name_a)
+        pb = get_player_or_default(player_lookup, tour, name_b)
+        X_ab = build_matchup_row(pa, pb, tour, surface, best_of, feature_cols)
+        p = predict_prob_single(pipeline, X_ab)
+        prob_cache[(name_a, name_b)] = p
+        prob_cache[(name_b, name_a)] = 1.0 - p
+        return p
+
+    # Pre-warm all pairwise probabilities for fast vectorized Monte Carlo
+    for i in range(n):
+        for j in range(i + 1, n):
+            get_pair_prob(bracket_players[i], bracket_players[j])
+
+    round_names_map = {
+        32: ["Round of 32", "Round of 16", "Quarterfinals", "Semifinals", "Championship Final"],
+        16: ["Round of 16", "Quarterfinals", "Semifinals", "Championship Final"],
+        8: ["Quarterfinals", "Semifinals", "Championship Final"],
+    }
+    r_names = round_names_map.get(n, [f"Round {r + 1}" for r in range(int(math.log2(n)))])
+
+    # 1. Deterministic most-likely bracket path (every match with exact % forecasting)
+    det_rounds = []
+    curr = list(bracket_players)
+    for r_idx, r_title in enumerate(r_names):
+        matches_out = []
+        nxt_curr = []
+        for m_idx in range(0, len(curr), 2):
+            p1, p2 = curr[m_idx], curr[m_idx + 1]
+            prob1 = get_pair_prob(p1, p2)
+            if r_idx == 0 and (m_idx // 2) in forced_r1:
+                winner = forced_r1[m_idx // 2]
+                note = "Manual Override"
+            else:
+                winner = p1 if prob1 >= 0.5 else p2
+                note = "Model Pick"
+            matches_out.append({
+                "Match": f"M{m_idx // 2 + 1}",
+                "Player 1": p1,
+                "P1 Win %": round(prob1 * 100.0, 1),
+                "Player 2": p2,
+                "P2 Win %": round((1.0 - prob1) * 100.0, 1),
+                "Projected Winner": f"🏆 {winner}",
+                "Pick Type": note,
+            })
+            nxt_curr.append(winner)
+        det_rounds.append((r_title, pd.DataFrame(matches_out)))
+        curr = nxt_curr
+
+    # 2. Monte Carlo simulation (n_sims full tournament runs)
+    rng = np.random.default_rng(42)
+    reach_counts = {p: [0] * (len(r_names) + 1) for p in bracket_players}
+    for _ in range(n_sims):
+        sim_curr = list(bracket_players)
+        for r_idx in range(len(r_names)):
+            sim_nxt = []
+            for m_idx in range(0, len(sim_curr), 2):
+                p1, p2 = sim_curr[m_idx], sim_curr[m_idx + 1]
+                if r_idx == 0 and (m_idx // 2) in forced_r1:
+                    w = forced_r1[m_idx // 2]
+                else:
+                    w = p1 if rng.random() < get_pair_prob(p1, p2) else p2
+                reach_counts[w][r_idx + 1] += 1
+                sim_nxt.append(w)
+            sim_curr = sim_nxt
+
+    odds_rows = []
+    for seed_idx, p in enumerate(bracket_players, start=1):
+        p_info = get_player_or_default(player_lookup, tour, p)
+        row_dict = {
+            "Seed": seed_idx,
+            "Player": p,
+            "Elo": round(float(p_info["elo_overall"])),
+            "Pts": int(p_info.get("ranking_points", 0)),
+        }
+        for r_idx, r_title in enumerate(r_names):
+            col_lbl = "🏆 Win Title %" if r_idx == len(r_names) - 1 else f"Reach {r_names[r_idx + 1]} %"
+            row_dict[col_lbl] = round(reach_counts[p][r_idx + 1] / n_sims * 100.0, 1)
+        odds_rows.append(row_dict)
+
+    odds_df = pd.DataFrame(odds_rows).sort_values("🏆 Win Title %", ascending=False).reset_index(drop=True)
+    return det_rounds, odds_df
+
+
 st.title("🎾 ATP & WTA Machine Learning Match Predictor Lab")
 st.caption("Chronological Surface-Elo + Age + Ranking Points + Career Trophies Engine • Live Supabase & ESPN Sync")
 
@@ -558,12 +715,13 @@ leaderboard_df = load_leaderboard()
 feature_cols = load_feature_cols()
 pipelines = load_all_pipelines(leaderboard_df["full_label"].tolist())
 
-tab_today, tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab_today, tab_bracket, tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📅 Today's Match Forecasts",
+    "🏆 Tournament Bracket Predictor",
     "🔮 Custom Matchup Simulator",
-    "🏆 Model Leaderboard & Overfitting Lab",
+    "📊 Model Leaderboard & Overfitting Lab",
     "📈 Diagnostic Graphs & Learning Curves",
-    "📊 ATP / WTA Elo & Trophy Rankings",
+    "🥇 ATP / WTA Elo & Trophy Rankings",
     "📋 Player Match History",
 ])
 
@@ -654,6 +812,116 @@ with tab_today:
 
             st.subheader("Why the Model Favors This Player (Key Variables)")
             render_match_drivers(pipelines[slate_model], sel_X, sel_p1, sel_p2, sel_m["Player1"], sel_m["Player2"], sel_m["Surface"])
+
+with tab_bracket:
+    st.subheader("🏆 Interactive Tournament Bracket & Monte Carlo Predictor")
+    st.caption("Predicts every round's winner with exact ML win probabilities and runs 1,000 Monte Carlo simulations for title odds.")
+
+    bc1, bc2, bc3, bc4 = st.columns([1, 1, 1.3, 1.7])
+    b_tour = bc1.selectbox("Tour", ["ATP", "WTA"], key="b_tour")
+    b_size = bc2.selectbox("Bracket Size", [16, 8, 32], index=0, format_func=lambda x: f"{x}-Player Draw", key="b_size")
+    b_source = bc3.selectbox("Draw Source", ["Next Major (2027 Australian Open)", "Live ESPN Tournament (If Active)"], key="b_source")
+    b_model = bc4.selectbox("Forecasting Model", leaderboard_df["full_label"].tolist(), index=0, key="b_model")
+
+    b_tour_df = players_df[players_df["tour"] == b_tour].copy()
+    # Rank seeds by official ranking points first, breaking ties with Elo
+    b_tour_df = b_tour_df.sort_values(["ranking_points", "elo_overall"], ascending=[False, False]).reset_index(drop=True)
+    top_pool = b_tour_df["player_name"].head(64).tolist()
+
+    live_draw = fetch_espn_tournament_draw(b_tour) if "ESPN" in b_source else None
+    if live_draw:
+        t_title = f"{live_draw['name']} ({b_tour})"
+        default_surf = live_draw["surface"]
+        raw_seeded = []
+        for p1_e, p2_e in live_draw["pairs"]:
+            for nm in (p1_e, p2_e):
+                if nm not in raw_seeded:
+                    raw_seeded.append(nm)
+        for nm in top_pool:
+            if len(raw_seeded) >= b_size:
+                break
+            if nm not in raw_seeded:
+                raw_seeded.append(nm)
+        seeded_players = raw_seeded[:b_size]
+    else:
+        if "ESPN" in b_source:
+            st.info(f"No active {b_tour} tournament draw is live on ESPN right now (off-season). Loaded projected **2027 Australian Open** seeded draw!")
+        t_title = f"2027 Australian Open — Projected {b_tour} Top-{b_size} Draw"
+        default_surf = "Hard"
+        seeded_players = top_pool[:b_size]
+
+    sc1, sc2, sc3 = st.columns([2, 1, 1])
+    custom_title = sc1.text_input("Tournament Name", value=t_title, key="b_title")
+    b_surface = sc2.selectbox("Court Surface", ["Hard", "Clay", "Grass"], index=["Hard", "Clay", "Grass"].index(default_surf), key="b_surf")
+    b_best_of = sc3.selectbox("Format", [5, 3] if (b_tour == "ATP" and "Australian Open" in custom_title) else [3, 5], format_func=lambda x: f"Best of {x}", key="b_bo")
+
+    # Place seeds into standard tournament bracket positions (1 vs 16, 8 vs 9, etc.)
+    seed_slots = _standard_seed_order(b_size)
+    bracket_order = [seeded_players[s - 1] for s in seed_slots]
+
+    with st.expander("🛠️ Customize Draw Lineup or Force Round-1 Upsets ('What-If' Simulator)"):
+        st.markdown("**Swap any seeded slot or lock in a Round-1 upset to watch the entire tournament recalculate:**")
+        forced_r1 = {}
+        ov_cols = st.columns(2)
+        for m_i in range(b_size // 2):
+            p_top = bracket_order[2 * m_i]
+            p_bot = bracket_order[2 * m_i + 1]
+            choice = ov_cols[m_i % 2].selectbox(
+                f"R1 Match {m_i + 1}: #{seed_slots[2 * m_i]} {p_top} vs #{seed_slots[2 * m_i + 1]} {p_bot}",
+                ["Auto (ML Model)", f"Force {p_top}", f"Force {p_bot}"],
+                key=f"r1_ov_{b_tour}_{b_size}_{m_i}",
+            )
+            if choice == f"Force {p_top}":
+                forced_r1[m_i] = p_top
+            elif choice == f"Force {p_bot}":
+                forced_r1[m_i] = p_bot
+
+    det_rounds, odds_df = simulate_tournament_bracket(
+        bracket_order, player_lookup, b_tour, b_surface, int(b_best_of),
+        pipelines[b_model], feature_cols, forced_r1, n_sims=1000,
+    )
+
+    champ_row = odds_df.iloc[0]
+    runner_row = odds_df.iloc[1]
+    k1, k2, k3 = st.columns(3)
+    k1.metric("🏆 Projected Tournament Champion", champ_row["Player"], f"{champ_row['🏆 Win Title %']:.1f}% Title Odds")
+    k2.metric("🥈 Top Contender / Runner-Up", runner_row["Player"], f"{runner_row['🏆 Win Title %']:.1f}% Title Odds")
+    k3.metric("🎯 Model & Surface", b_model.split("[")[0].strip(), f"{b_surface} • Best of {b_best_of}")
+
+    st.markdown("### 📊 Championship & Round-by-Round Survival Probabilities (1,000 Simulations)")
+    col_odds, col_chart = st.columns([1.3, 1])
+    with col_odds:
+        pct_cols = [c for c in odds_df.columns if "%" in c]
+        st.dataframe(
+            odds_df.style.format({c: "{:.1f}%" for c in pct_cols}),
+            use_container_width=True,
+            hide_index=True,
+        )
+    with col_chart:
+        top8_odds = odds_df.head(8)
+        fig_champ = px.bar(
+            top8_odds,
+            x="🏆 Win Title %",
+            y="Player",
+            orientation="h",
+            text="🏆 Win Title %",
+            color="🏆 Win Title %",
+            color_continuous_scale="Blues",
+            title=f"{custom_title} — Title Probability (%)",
+        )
+        fig_champ.update_layout(yaxis={"categoryorder": "total ascending"}, height=360, showlegend=False, coloraxis_showscale=False)
+        st.plotly_chart(fig_champ, use_container_width=True)
+
+    st.markdown("---")
+    st.markdown("### 🎾 Match-by-Match Forecast Across Every Round")
+    round_tabs = st.tabs([r_title for r_title, _ in det_rounds])
+    for r_tab, (r_title, r_df) in zip(round_tabs, det_rounds):
+        with r_tab:
+            st.dataframe(
+                r_df.style.format({"P1 Win %": "{:.1f}%", "P2 Win %": "{:.1f}%"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 with tab1:
     st.subheader("Head-to-Head Matchup Simulator")
@@ -871,6 +1139,7 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
 
 
 
