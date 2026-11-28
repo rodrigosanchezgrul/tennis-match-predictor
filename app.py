@@ -331,6 +331,17 @@ def explain_matchup_drivers(pipeline, X_row: pd.DataFrame, p1, p2, p1_name: str,
         ),
     ]
 
+    # Direction sign (+1 if P1 strictly beats P2 on that metric, -1 if P2 beats P1, 0 if tied)
+    true_sign = {
+        "Overall Elo Rating": np.sign(float(p1["elo_overall"]) - float(p2["elo_overall"])),
+        f"{surface} Court Elo": np.sign(float(p1[surf_col]) - float(p2[surf_col])),
+        "52-Week Ranking Points": np.sign(float(p1.get("ranking_points", 0)) - float(p2.get("ranking_points", 0))),
+        "Career Titles (GS / M1000)": np.sign((float(p1.get("grand_slams", 0)) * 3 + float(p1.get("masters_1000", 0))) - (float(p2.get("grand_slams", 0)) * 3 + float(p2.get("masters_1000", 0)))),
+        "Player Age & Peak Curve": np.sign(abs(float(p2.get("age", 26.0)) - 25.0) - abs(float(p1.get("age", 26.0)) - 25.0)),
+        "Recent Form (Last 10)": np.sign(float(p1.get("form_10", 0.5)) - float(p2.get("form_10", 0.5))),
+        "14-Day Match Load": np.sign(float(p1.get("matches_14d", 0)) - float(p2.get("matches_14d", 0))),
+    }
+
     driver_rows = []
     for label, overrides, p1_disp, p2_disp in groups:
         X_cf = X_row.copy()
@@ -339,8 +350,19 @@ def explain_matchup_drivers(pipeline, X_row: pd.DataFrame, p1, p2, p1_name: str,
                 X_cf[col] = val
         cf_prob = predict_prob_single(pipeline, X_cf)
         shift_pct = (base_prob - cf_prob) * 100.0  # + favors P1, - favors P2
+
+        # Enforce directional consistency so tree split noise never credits the inferior stat
+        expected = true_sign.get(label, 0)
+        if expected == 0 or (shift_pct * expected < 0):
+            shift_pct = 0.0
+
         if abs(shift_pct) < 0.05:
-            fav = "Even"
+            if expected > 0:
+                fav = f"{p1_name} (edge)"
+            elif expected < 0:
+                fav = f"{p2_name} (edge)"
+            else:
+                fav = "Even"
         elif shift_pct > 0:
             fav = f"{p1_name} (+{shift_pct:.1f}%)"
         else:
@@ -822,3 +844,4 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
