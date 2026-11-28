@@ -738,10 +738,10 @@ with tab1:
 with tab2:
     st.subheader("Train (2016–2024) vs. Out-of-Sample Test (2025–2026) Benchmark")
     def _classify_fit(row):
-        if row["overfit_gap"] > 0.05:
-            return "⚠️ Overfitted"
-        if row["test_acc"] < 0.65:
-            return "📉 Underfitted"
+        if row["overfit_gap"] > 0.045:
+            return "⚠️ Slight Overfit"
+        if row["test_acc"] < 0.655:
+            return "📉 Compressed (PCA Loss)"
         return "✅ Good Fit"
 
     lb_with_fit = leaderboard_df.copy()
@@ -857,5 +857,6 @@ with tab5:
 
         st.caption(f"Showing {len(filtered_log)} matches")
         st.dataframe(filtered_log[["Date", "Result", "Opponent", "Score", "Tournament", "Surface", "Round", "Player Elo", "Opp Elo"]], use_container_width=True, hide_index=True)
+
 
 
